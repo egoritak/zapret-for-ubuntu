@@ -1,6 +1,14 @@
+/.linux-backend/
+__pycache__/
+*.pyc
+
+# Runtime/update-managed source payload
+/zapret-discord/*
+!/zapret-discord/.gitkeep
+
+# Legacy flat-layout mutable files
 /utils/test results
 /utils/game_filter.enabled
 /lists/ipset-exclude-user.txt
 /lists/list-general-user.txt
 /lists/list-exclude-user.txt
-/.linux-backend/
