@@ -22,6 +22,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from tkinter import Canvas, IntVar, StringVar, Tk, Toplevel
 from tkinter import ttk
+from tkinter import messagebox
 from tkinter.scrolledtext import ScrolledText
 
 try:
@@ -149,6 +150,7 @@ class ZapretGuiApp:
         self.strategy_combo: ttk.Combobox | None = None
         self.autostart_check: ttk.Checkbutton | None = None
         self.update_button: ttk.Button | None = None
+        self.uninstall_button: ttk.Button | None = None
         self.autostart_busy = False
         self.autostart_update_in_progress = False
         self.autostart_enabled_cached = False
@@ -375,6 +377,25 @@ class ZapretGuiApp:
             foreground=[("active", self.palette["accent_hover"])],
             background=[("active", self.palette["card"])],
         )
+        style.configure(
+            "Danger.TButton",
+            font=("Ubuntu", 10),
+            foreground="#ffd9e2",
+            background="#3a1d28",
+            borderwidth=0,
+            focusthickness=0,
+            relief="flat",
+            padding=(10, 8),
+        )
+        style.map(
+            "Danger.TButton",
+            foreground=[("active", "#ffe8ee")],
+            background=[
+                ("pressed", "#351821"),
+                ("active", "#44202d"),
+                ("disabled", "#2a1a1f"),
+            ],
+        )
 
         style.configure(
             "App.TCombobox",
@@ -566,6 +587,13 @@ class ZapretGuiApp:
             footer, text="Logs", style="Secondary.TButton", command=self.open_logs_window
         )
         self.logs_button.pack(side="right")
+        self.uninstall_button = ttk.Button(
+            footer,
+            text="Remove",
+            style="Danger.TButton",
+            command=self.request_uninstall,
+        )
+        self.uninstall_button.pack(side="right", padx=(8, 0))
 
         self.refresh_action_button()
 
@@ -847,6 +875,9 @@ class ZapretGuiApp:
         if self.update_in_progress:
             self.log("Update is in progress. Exit is blocked until update finishes.")
             return
+        if self.is_busy and self.busy_operation == "uninstall":
+            self.log("Uninstall is in progress. Exit is blocked until it finishes.")
+            return
         self.is_exiting = True
         if not sys.platform.startswith("linux"):
             self.disconnect()
@@ -1028,6 +1059,14 @@ class ZapretGuiApp:
             if self.update_button is None or not self.update_button.winfo_exists():
                 return
             self.update_button.configure(state="normal" if enabled else "disabled")
+
+        self.root.after(0, _apply)
+
+    def set_uninstall_button_enabled(self, enabled: bool) -> None:
+        def _apply() -> None:
+            if self.uninstall_button is None or not self.uninstall_button.winfo_exists():
+                return
+            self.uninstall_button.configure(state="normal" if enabled else "disabled")
 
         self.root.after(0, _apply)
 
@@ -2254,6 +2293,7 @@ class ZapretGuiApp:
         self.set_strategy_selector_enabled(False)
         self.set_autostart_check_enabled(False)
         self.set_update_button_enabled(False)
+        self.set_uninstall_button_enabled(False)
         self._apply_update_button_visibility(False)
         self.start_update_animation()
         self.refresh_action_button()
@@ -2469,6 +2509,7 @@ class ZapretGuiApp:
                 self.set_strategy_selector_enabled(True)
                 self.set_autostart_check_enabled(True)
                 self.set_update_button_enabled(True)
+                self.set_uninstall_button_enabled(True)
                 self._apply_update_button_visibility(self.update_available)
                 self.refresh_strategies(quiet=True)
                 self.refresh_autostart_state_async()
@@ -2491,6 +2532,80 @@ class ZapretGuiApp:
             target_version,
             reason=f"Starting update to {target_version or 'new version'}...",
         )
+
+    def request_uninstall(self) -> None:
+        if self.update_in_progress:
+            self.log("Cannot uninstall while update is in progress.")
+            return
+        if self.is_busy:
+            self.log("Cannot uninstall while another operation is in progress.")
+            return
+
+        script_path = self.app_dir / "uninstall-zapret.sh"
+        if not script_path.exists():
+            self.log(f"[ERROR] Uninstall script not found: {script_path}")
+            return
+
+        answer = messagebox.askyesno(
+            "Remove Zapret",
+            (
+                "This will remove systemd service, zapret-discord directory, "
+                "and uninstall the application package.\n\nContinue?"
+            ),
+            icon="warning",
+        )
+        if not answer:
+            return
+
+        self.is_busy = True
+        self.busy_operation = "uninstall"
+        self.cancel_requested = False
+        self.set_status("Uninstalling...")
+        self.set_strategy_selector_enabled(False)
+        self.set_autostart_check_enabled(False)
+        self.set_update_button_enabled(False)
+        self.set_uninstall_button_enabled(False)
+        self._apply_update_button_visibility(False)
+        self.refresh_action_button()
+        threading.Thread(target=self._uninstall_worker, daemon=True).start()
+
+    def _uninstall_worker(self) -> None:
+        success = False
+        try:
+            script_path = self.app_dir / "uninstall-zapret.sh"
+            if not script_path.exists():
+                raise RuntimeError(f"Uninstall script not found: {script_path}")
+            if not os.access(script_path, os.X_OK):
+                script_path.chmod(0o755)
+
+            self.log("Running uninstall script (root privileges required)...")
+            command = self.elevate_command([str(script_path), "--yes"])
+            self.run_logged_command(command, cwd=self.app_dir)
+            self.log("Uninstall completed. Closing application...")
+            success = True
+        except Exception as exc:  # pylint: disable=broad-except
+            self.set_status("Error")
+            self.log(f"[ERROR] Uninstall failed: {exc}")
+        finally:
+            if success:
+                def _close() -> None:
+                    self.is_exiting = True
+                    self.stop_tray_icon()
+                    self.root.destroy()
+
+                self.root.after(0, _close)
+                return
+
+            self.is_busy = False
+            self.busy_operation = None
+            self.cancel_requested = False
+            self.set_strategy_selector_enabled(True)
+            self.set_autostart_check_enabled(True)
+            self.set_update_button_enabled(True)
+            self.set_uninstall_button_enabled(True)
+            self.refresh_autostart_state_async()
+            self.check_updates_async()
+            self.root.after(0, self.refresh_action_button)
 
     def check_updates(self) -> None:
         flag = self.source_dir / "utils" / "check_updates.enabled"

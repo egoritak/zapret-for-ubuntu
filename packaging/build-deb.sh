@@ -20,6 +20,7 @@ mkdir -p "${PKG_ROOT}/usr/share/applications"
 mkdir -p "${PKG_ROOT}/usr/share/doc/${APP_NAME}"
 
 install -m 0755 "${ROOT_DIR}/run-ubuntu-gui.sh" "${PKG_ROOT}/opt/${APP_NAME}/run-ubuntu-gui.sh"
+install -m 0755 "${ROOT_DIR}/uninstall-zapret.sh" "${PKG_ROOT}/opt/${APP_NAME}/uninstall-zapret.sh"
 install -m 0644 "${ROOT_DIR}/zapret_gui.py" "${PKG_ROOT}/opt/${APP_NAME}/zapret_gui.py"
 install -m 0644 "${ROOT_DIR}/LICENSE.txt" "${PKG_ROOT}/usr/share/doc/${APP_NAME}/copyright"
 install -m 0644 "${ROOT_DIR}/README.md" "${PKG_ROOT}/usr/share/doc/${APP_NAME}/README.md"
