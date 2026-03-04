@@ -2531,8 +2531,8 @@ class ZapretGuiApp:
         source_root = self.source_dir.resolve()
         if source_root == self.app_dir.resolve():
             raise RuntimeError("Refusing to replace source tree: source directory points to application root.")
-        if not self._is_within_dir(source_root, self.app_dir):
-            raise RuntimeError("Refusing to replace source tree outside application directory.")
+        if not self._is_within_dir(source_root, self.data_root):
+            raise RuntimeError("Refusing to replace source tree outside data directory.")
         if not source_payload_dir.is_dir():
             raise RuntimeError(f"Invalid extracted source directory: {source_payload_dir}")
 
@@ -2558,9 +2558,12 @@ class ZapretGuiApp:
         work_dir: Path | None = None
         try:
             if sys.platform.startswith("linux"):
-                self.log("Stopping current service before update...")
-                self.stop_managed_service()
-                self.log("Service stopped. Starting update...")
+                if self.managed_service_exists() or self.service_active_cached:
+                    self.log("Stopping current service before update...")
+                    self.stop_managed_service()
+                    self.log("Service stopped. Starting update...")
+                else:
+                    self.log("Managed service is not installed yet. Starting update...")
             else:
                 self.log("Starting update...")
 
