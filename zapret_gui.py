@@ -120,6 +120,7 @@ class ZapretGuiApp:
         self.update_spinner_frames = ["↻", "↺", "⟳", "⟲"]
         self.update_spinner_index = 0
         self.update_animation_job: str | None = None
+        self.no_strategy_update_attempted = False
         self.last_selected_strategy: Strategy | None = None
 
         self.linux_root = self.app_dir / ".linux-backend"
@@ -609,10 +610,10 @@ class ZapretGuiApp:
         if self.update_in_progress:
             return {
                 "label": f"Updating {self._update_spinner_symbol()}",
-                "fill": "#1b1f2a",
-                "text": self.palette["accent_hover"],
-                "ring": self.palette["accent_hover"],
-                "glow": self.palette["accent"],
+                "fill": "#0d101a",
+                "text": "#8a94ab",
+                "ring": "#4b556e",
+                "glow": "#303a51",
                 "cursor": "arrow",
             }
         if not self.strategies_map:
@@ -941,7 +942,8 @@ class ZapretGuiApp:
 
     def toggle_connection(self) -> None:
         if not self.strategies_map:
-            self.log("No strategy available.")
+            self.log("No strategy available. Trying to recover from latest release...")
+            self.start_update_for_no_strategy(automatic=False)
             return
         if self.update_in_progress:
             self.log("Update is in progress. Wait until it finishes.")
@@ -1219,8 +1221,10 @@ class ZapretGuiApp:
             self.update_autostart_info_label()
             if not quiet:
                 self.log("No strategy files found (expected general*.bat or general*.sh).")
+            self.start_update_for_no_strategy(automatic=True)
             return
 
+        self.no_strategy_update_attempted = False
         if self.action_canvas is not None:
             self.action_canvas.configure(state="normal")
         current = self.strategy_var.get()
@@ -2211,6 +2215,95 @@ class ZapretGuiApp:
     def check_updates_async(self) -> None:
         threading.Thread(target=self.check_updates, daemon=True).start()
 
+    def _fetch_latest_release_info(self) -> tuple[str, str, str]:
+        version_url, release_url, download_url = self.parse_update_sources()
+        req = urllib.request.Request(
+            version_url,
+            headers={
+                "User-Agent": "zapret-ubuntu-gui/1.0",
+                "Cache-Control": "no-cache",
+            },
+        )
+        with urllib.request.urlopen(req, timeout=10) as response:
+            latest_version = response.read().decode("utf-8", errors="replace").strip()
+        if not latest_version:
+            raise RuntimeError("Latest version is empty.")
+
+        release_page = f"{release_url}{latest_version}" if release_url else download_url
+        archive_url = self.build_release_archive_url(latest_version)
+        if not archive_url:
+            raise RuntimeError("Cannot build archive URL for latest release.")
+        return latest_version, release_page, archive_url
+
+    def _begin_update(self, archive_url: str, target_version: str, *, reason: str) -> None:
+        clean_archive = archive_url.strip()
+        clean_target = target_version.strip()
+        if not clean_archive:
+            self.log("Update archive URL is not available.")
+            return
+        if self.update_in_progress:
+            self.log("Update is already in progress.")
+            return
+
+        self.update_in_progress = True
+        self.update_available = False
+        self.is_busy = True
+        self.busy_operation = "update"
+        self.cancel_requested = False
+        self.set_status("Updating...")
+        self.set_strategy_selector_enabled(False)
+        self.set_autostart_check_enabled(False)
+        self.set_update_button_enabled(False)
+        self._apply_update_button_visibility(False)
+        self.start_update_animation()
+        self.refresh_action_button()
+        self.log(reason)
+        threading.Thread(
+            target=self._update_worker,
+            args=(clean_archive, clean_target),
+            daemon=True,
+        ).start()
+
+    def start_update_for_no_strategy(self, *, automatic: bool) -> None:
+        if self.strategies_map:
+            return
+        if self.update_in_progress:
+            return
+        if self.is_busy:
+            if not automatic:
+                self.log("Cannot start recovery update while another operation is in progress.")
+            return
+        if automatic and self.no_strategy_update_attempted:
+            return
+        if automatic:
+            self.no_strategy_update_attempted = True
+
+        def _worker() -> None:
+            try:
+                self.log("No strategy detected. Preparing latest release update...")
+                latest_version, release_page, archive_url = self._fetch_latest_release_info()
+                self.set_update_available_state(
+                    available=True,
+                    latest_version=latest_version,
+                    archive_url=archive_url,
+                    release_page_url=release_page,
+                )
+
+                def _start() -> None:
+                    if self.strategies_map or self.update_in_progress or self.is_busy:
+                        return
+                    self._begin_update(
+                        archive_url,
+                        latest_version,
+                        reason=f"No strategy detected. Starting update to {latest_version}...",
+                    )
+
+                self.root.after(0, _start)
+            except Exception as exc:  # pylint: disable=broad-except
+                self.log(f"[ERROR] Failed to start recovery update: {exc}")
+
+        threading.Thread(target=_worker, daemon=True).start()
+
     @staticmethod
     def build_release_archive_url(version: str) -> str:
         clean = version.strip()
@@ -2385,9 +2478,6 @@ class ZapretGuiApp:
             self.root.after(0, _finish)
 
     def start_update(self) -> None:
-        if self.update_in_progress:
-            self.log("Update is already in progress.")
-            return
         if self.is_busy:
             self.log("Cannot start update while another operation is in progress.")
             return
@@ -2395,28 +2485,12 @@ class ZapretGuiApp:
             self.log("Current version is already up to date.")
             return
         archive_url = self.update_archive_url.strip()
-        if not archive_url:
-            self.log("Update archive URL is not available.")
-            return
-
-        self.update_in_progress = True
-        self.update_available = False
-        self.is_busy = True
-        self.busy_operation = "update"
-        self.cancel_requested = False
-        self.set_status("Updating...")
-        self.set_strategy_selector_enabled(False)
-        self.set_autostart_check_enabled(False)
-        self.set_update_button_enabled(False)
-        self._apply_update_button_visibility(False)
-        self.start_update_animation()
-        self.refresh_action_button()
-        self.log(f"Starting update to {self.latest_version or 'new version'}...")
-        threading.Thread(
-            target=self._update_worker,
-            args=(archive_url, self.latest_version),
-            daemon=True,
-        ).start()
+        target_version = self.latest_version.strip()
+        self._begin_update(
+            archive_url,
+            target_version,
+            reason=f"Starting update to {target_version or 'new version'}...",
+        )
 
     def check_updates(self) -> None:
         flag = self.source_dir / "utils" / "check_updates.enabled"

@@ -28,6 +28,7 @@ To update source files, replace contents of `zapret-discord/` only.
 - `Autostart` checkbox controls service boot autostart (`enable`/`disable`);
 - when a newer version is detected, update button (`⟳`) appears near version badge;
 - update button downloads release zip and replaces `zapret-discord/` automatically;
+- when no strategies are found, launcher automatically starts recovery update from latest release;
 - on first `.bat` service preparation, launcher clones/updates official Linux backend (`bol-van/zapret`) and builds binaries.
 - main window is minimal: one large `Connect/Disconnect` action button + strategy dropdown + footer controls.
 - app can stay in system tray with `Show Zapret`, `Connect/Disconnect`, `Exit`.
@@ -94,6 +95,7 @@ The backend repository is stored at:
 - during update:
   - active service is stopped;
   - `Connect/Disconnect` action is blocked;
+  - strategy selector and autostart checkbox are disabled;
   - main circle button shows `Updating` with spinner;
   - source files in `zapret-discord/` are replaced from downloaded archive;
   - user override files are preserved:
