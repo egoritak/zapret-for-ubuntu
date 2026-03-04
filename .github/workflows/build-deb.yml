@@ -14,6 +14,9 @@ permissions:
 jobs:
   build-deb:
     runs-on: ubuntu-latest
+    env:
+      DEB_VERSION: 1.0.${{ github.run_number }}
+      DEB_TAG: deb-v1.0.${{ github.run_number }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -24,11 +27,48 @@ jobs:
           sudo apt-get install -y dpkg-dev
 
       - name: Build .deb package
-        env:
-          DEB_VERSION: 1.0.${{ github.run_number }}
         run: |
           ./packaging/build-deb.sh
           ls -lah dist
+
+      - name: Prepare release notes
+        id: release_notes
+        uses: actions/github-script@v7
+        env:
+          DEB_VERSION: ${{ env.DEB_VERSION }}
+        with:
+          script: |
+            const { owner, repo } = context.repo;
+            const maxItems = 8;
+            const refName = context.ref.replace("refs/heads/", "");
+
+            let items = [];
+            if (context.eventName === "push" && Array.isArray(context.payload.commits) && context.payload.commits.length > 0) {
+              const commits = context.payload.commits.slice(-maxItems).reverse();
+              items = commits.map((c) => {
+                const id = (c.id || "").slice(0, 7);
+                const msg = (c.message || "").split("\n")[0];
+                const url = c.url || `https://github.com/${owner}/${repo}/commit/${c.id}`;
+                return `- ${msg} ([${id}](${url}))`;
+              });
+            } else {
+              const shortSha = context.sha.slice(0, 7);
+              const url = `https://github.com/${owner}/${repo}/commit/${context.sha}`;
+              items = [`- Manual run for commit [${shortSha}](${url})`];
+            }
+
+            const body = [
+              "Автоматическая сборка .deb",
+              "",
+              `Версия пакета: \`${process.env.DEB_VERSION}\``,
+              `Ветка: \`${refName}\``,
+              `Коммит: [\`${context.sha.slice(0, 7)}\`](https://github.com/${owner}/${repo}/commit/${context.sha})`,
+              "",
+              "### Краткие изменения",
+              ...items
+            ].join("\n");
+
+            core.setOutput("body", body);
 
       - name: Upload artifact
         id: upload_artifact
@@ -113,9 +153,22 @@ jobs:
           files: |
             dist/*.deb
             dist/*.sha256
-          body: |
-            Автоматическая сборка .deb из последнего push в `master`.
-            Файл заменяется на каждом новом запуске workflow.
+          body: ${{ steps.release_notes.outputs.body }}
+          fail_on_unmatched_files: true
+          generate_release_notes: false
+          overwrite_files: true
+
+      - name: Publish versioned deb release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ env.DEB_TAG }}
+          name: ${{ env.DEB_TAG }}
+          prerelease: true
+          make_latest: false
+          files: |
+            dist/*.deb
+            dist/*.sha256
+          body: ${{ steps.release_notes.outputs.body }}
           fail_on_unmatched_files: true
           generate_release_notes: false
           overwrite_files: true
