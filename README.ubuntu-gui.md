@@ -9,6 +9,7 @@ Launcher logic and zapret-discord sources are now separated.
   - `zapret_gui.py`
   - `run-ubuntu-gui.sh`
   - `.linux-backend/`
+  - `icons/zapret.ico`
 - replaceable zapret-discord sources:
   - `zapret-discord/`
   - (`bin/`, `lists/`, `utils/`, `.service/`, `service.bat`, `general*.bat`, `general*.sh`)
@@ -22,8 +23,12 @@ To update source files, replace contents of `zapret-discord/` only.
   - `general*.sh`
 - checks project updates on startup (same source URLs as `service.bat`);
 - on Linux, `.bat` strategies are automatically converted to Linux `nfqws` config and run **without Wine**;
-- on first `.bat` launch, automatically clones/updates official Linux backend (`bol-van/zapret`) and builds binaries.
+- on startup, launcher ensures managed systemd service exists (creates/updates it when missing);
+- `Connect/Disconnect` controls managed systemd service state (`start`/`stop`);
+- `Autostart` checkbox controls service boot autostart (`enable`/`disable`);
+- on first `.bat` service preparation, launcher clones/updates official Linux backend (`bol-van/zapret`) and builds binaries.
 - main window is minimal: one large `Connect/Disconnect` action button + strategy dropdown + footer controls.
+- app can stay in system tray with `Show Zapret`, `Connect/Disconnect`, `Exit`.
 - if old flat layout is detected, launcher auto-migrates known source files into `zapret-discord/`.
 
 ## Run
@@ -45,6 +50,8 @@ You will be asked for administrator privileges (`pkexec` or `sudo`) to apply fir
 
 - `python3`
 - `python3-tk`
+- `python3-pil` (recommended for proper icon conversion/rendering)
+- `python3-gi` + Gtk3 introspection (`gir1.2-gtk-3.0`) for tray icon/menu
 - `git`
 - `make`
 - `gcc`
@@ -59,8 +66,10 @@ When you press `Connect` on `general (ALT*).bat` in Ubuntu:
 2. converts `--wf-tcp/--wf-udp` to `NFQWS_PORTS_TCP/UDP`;
 3. writes generated Linux config to:
    - `.linux-backend/state/config.generated`
-4. starts/restarts Linux zapret service script with this config:
-   - `.linux-backend/zapret/init.d/sysv/zapret restart`
+4. installs/updates managed systemd unit:
+   - `/etc/systemd/system/zapret-discord-autostart.service`
+5. starts service with:
+   - `systemctl start zapret-discord-autostart.service`
 
 Generated config uses your current username as `WS_USER`, so `nfqws` can read lists/binary payloads
 inside your home directory.
@@ -82,15 +91,32 @@ The backend repository is stored at:
 
 ## Systemd Autostart
 
-- `Autostart` checkbox controls system service:
+- `Autostart` checkbox controls system service boot enable state:
   - `zapret-discord-autostart.service`
 - when enabled, launcher:
   - generates config for currently selected `.bat` alternative
   - installs/updates systemd unit in `/etc/systemd/system/`
-  - runs `systemctl enable --now zapret-discord-autostart.service`
+  - runs `systemctl enable zapret-discord-autostart.service`
 - when disabled, launcher runs:
-  - `systemctl disable --now zapret-discord-autostart.service`
+  - `systemctl disable zapret-discord-autostart.service`
 - checkbox state is synced from `systemctl is-enabled` on startup.
+- connection state (button `Connect/Disconnect`) is synced from `systemctl is-active` on startup.
+
+## Tray behavior
+
+- app uses `icons/zapret.ico` as window/tray icon;
+- closing the main window hides app to tray;
+- tray menu has:
+  - `Show Zapret`
+  - `Connect`/`Disconnect`
+  - `Exit`
+
+## Menu entry
+
+- launcher auto-creates desktop entry in user menu:
+  - `~/.local/share/applications/zapret-gui.desktop`
+- icon is installed to:
+  - `~/.local/share/icons/hicolor/256x256/apps/zapret-gui.png`
 
 ## Notes
 

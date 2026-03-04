@@ -22,6 +22,38 @@ from tkinter import Canvas, IntVar, StringVar, Tk, Toplevel
 from tkinter import ttk
 from tkinter.scrolledtext import ScrolledText
 
+try:
+    from PIL import Image, ImageTk
+
+    PIL_AVAILABLE = True
+    if hasattr(Image, "Resampling"):
+        RESAMPLE_LANCZOS = Image.Resampling.LANCZOS
+    else:
+        RESAMPLE_LANCZOS = Image.LANCZOS
+except Exception:
+    Image = None
+    ImageTk = None
+    PIL_AVAILABLE = False
+    RESAMPLE_LANCZOS = None
+
+try:
+    import gi
+
+    gi.require_version("Gtk", "3.0")
+    from gi.repository import GLib, Gtk
+
+    GTK_TRAY_AVAILABLE = True
+    try:
+        gi.require_version("GdkPixbuf", "2.0")
+        from gi.repository import GdkPixbuf
+    except Exception:
+        GdkPixbuf = None
+except Exception:
+    GLib = None
+    GdkPixbuf = None
+    Gtk = None
+    GTK_TRAY_AVAILABLE = False
+
 
 FALLBACK_VERSION_URL = (
     "https://raw.githubusercontent.com/Flowseal/"
@@ -37,6 +69,11 @@ LEGACY_SOURCE_DIRS = ("bin", "lists", "utils", ".service")
 LEGACY_SOURCE_FILES = ("service.bat",)
 LEGACY_STRATEGY_PATTERNS = ("general*.bat", "general*.sh")
 AUTOSTART_SERVICE_NAME = "zapret-discord-autostart.service"
+DESKTOP_ENTRY_FILENAME = "zapret-gui.desktop"
+DESKTOP_ICON_BASENAME = "zapret-gui"
+APP_WM_CLASS = "ZapretGui"
+APP_ICONS_DIRNAME = "icons"
+APP_ICON_FILENAME = "zapret.ico"
 
 
 def natural_sort_key(value: str) -> list[object]:
@@ -104,6 +141,17 @@ class ZapretGuiApp:
         self.autostart_update_in_progress = False
         self.autostart_enabled_cached = False
         self.autostart_strategy_cached = ""
+        self.service_active_cached = False
+        self.tray_available = False
+        self.tray_icon: object | None = None
+        self.tray_menu: object | None = None
+        self.tray_toggle_item: object | None = None
+        self.tray_thread: threading.Thread | None = None
+        self.is_exiting = False
+        self.icons_dir = self.app_dir / APP_ICONS_DIRNAME
+        self.icon_source_path = self.resolve_icon_source_path()
+        self.icon_png_path = self.linux_state_dir / "zapret-icon-256.png"
+        self.tk_icon_photo = None
 
         self.strategy_var = StringVar()
         self.autostart_var = IntVar(value=0)
@@ -114,15 +162,20 @@ class ZapretGuiApp:
         self.last_selected_strategy_name = self.load_selected_strategy_name()
 
         self.logs_dir.mkdir(parents=True, exist_ok=True)
+        self.prepare_icon_assets()
+        self._setup_window_class()
 
         self._setup_style()
         self._build_ui()
         self.refresh_strategies()
         self.ensure_user_lists()
         self.check_updates_async()
+        self.ensure_managed_service_async()
         self.refresh_autostart_state_async()
+        self.ensure_desktop_entry()
 
         self.root.protocol("WM_DELETE_WINDOW", self.on_close)
+        self.setup_tray_icon()
 
     def _prepare_sources_root(self) -> Path:
         primary = self.app_dir / SOURCES_DIRNAME
@@ -223,6 +276,7 @@ class ZapretGuiApp:
         self.root.title("Zapret")
         self.root.geometry("430x760")
         self.root.minsize(390, 680)
+        self._setup_window_icon()
 
         self.palette = {
             "bg": "#060912",
@@ -349,6 +403,56 @@ class ZapretGuiApp:
                 ("active", self.palette["bg"]),
             ],
         )
+
+    def _setup_window_class(self) -> None:
+        try:
+            self.root.wm_class(APP_WM_CLASS, APP_WM_CLASS)
+            return
+        except Exception:
+            pass
+        try:
+            self.root.tk.call("wm", "class", self.root._w, APP_WM_CLASS)
+        except Exception:
+            pass
+
+    def resolve_icon_source_path(self) -> Path:
+        preferred = self.icons_dir / APP_ICON_FILENAME
+        legacy = self.app_dir / APP_ICON_FILENAME
+        try:
+            self.icons_dir.mkdir(parents=True, exist_ok=True)
+        except OSError:
+            return preferred if preferred.exists() else legacy
+
+        if preferred.exists():
+            return preferred
+
+        if legacy.exists():
+            try:
+                shutil.move(str(legacy), str(preferred))
+                return preferred
+            except OSError:
+                try:
+                    shutil.copy2(legacy, preferred)
+                    return preferred
+                except OSError:
+                    return legacy
+
+        return preferred
+
+    def _setup_window_icon(self) -> None:
+        if PIL_AVAILABLE and Image is not None and ImageTk is not None and self.icon_source_path.exists():
+            try:
+                image = Image.open(self.icon_source_path).convert("RGBA")
+                self.tk_icon_photo = ImageTk.PhotoImage(image)
+                self.root.iconphoto(True, self.tk_icon_photo)
+                return
+            except Exception:
+                pass
+        if self.icon_source_path.exists():
+            try:
+                self.root.iconbitmap(str(self.icon_source_path))
+            except Exception:
+                pass
 
     def _build_ui(self) -> None:
         app = ttk.Frame(self.root, style="App.TFrame", padding=(16, 14))
@@ -490,7 +594,12 @@ class ZapretGuiApp:
                 "cursor": "arrow",
             }
         if self.is_busy:
-            busy_label = "Stopping..." if self.cancel_requested else "Connecting..."
+            if self.cancel_requested or self.busy_operation in {"disconnect", "service-stop"}:
+                busy_label = "Stopping..."
+            elif self.busy_operation in {"connect", "service-start"}:
+                busy_label = "Connecting..."
+            else:
+                busy_label = "Working..."
             return {
                 "label": busy_label,
                 "fill": "#221824",
@@ -565,21 +674,241 @@ class ZapretGuiApp:
             self._terminate_subprocess(proc)
 
     def is_connected(self) -> bool:
+        if sys.platform.startswith("linux"):
+            return self.service_active_cached
         if self.current_runtime_mode == "linux-zapret":
             return True
         return self.process is not None and self.process.poll() is None
 
     def refresh_action_button(self) -> None:
         self._render_action_button()
+        self.refresh_tray_menu_state()
 
     def _action_hover(self, is_hover: bool) -> None:
         self.action_hovered = is_hover
         self.refresh_action_button()
 
+    def setup_tray_icon(self) -> None:
+        if not sys.platform.startswith("linux"):
+            return
+        if not GTK_TRAY_AVAILABLE:
+            self.log("System tray support is not available (Gtk3/PyGObject missing).")
+            return
+        if self.tray_thread is not None:
+            return
+        self.tray_thread = threading.Thread(target=self._tray_main, daemon=True)
+        self.tray_thread.start()
+
+    def _tray_main(self) -> None:
+        if Gtk is None:
+            return
+        try:
+            icon = Gtk.StatusIcon()
+            icon_path = self.icon_png_path if self.icon_png_path.exists() else self.icon_source_path
+            if icon_path.exists():
+                try:
+                    if GdkPixbuf is not None:
+                        pixbuf = GdkPixbuf.Pixbuf.new_from_file_at_scale(str(icon_path), 24, 24, True)
+                        icon.set_from_pixbuf(pixbuf)
+                    else:
+                        icon.set_from_file(str(icon_path))
+                except Exception:
+                    icon.set_from_icon_name("applications-system")
+            else:
+                icon.set_from_icon_name("applications-system")
+            icon.set_title("Zapret")
+            icon.set_tooltip_text("Zapret")
+            icon.set_visible(True)
+
+            menu = Gtk.Menu()
+            item_show = Gtk.MenuItem(label="Show Zapret")
+            item_show.connect("activate", self._tray_on_show)
+            menu.append(item_show)
+
+            item_toggle = Gtk.MenuItem(label="Connect")
+            item_toggle.connect("activate", self._tray_on_toggle)
+            menu.append(item_toggle)
+
+            item_exit = Gtk.MenuItem(label="Exit")
+            item_exit.connect("activate", self._tray_on_exit)
+            menu.append(item_exit)
+            menu.show_all()
+
+            icon.connect("activate", self._tray_on_show)
+            icon.connect("popup-menu", self._tray_on_popup)
+
+            self.tray_icon = icon
+            self.tray_menu = menu
+            self.tray_toggle_item = item_toggle
+            self.tray_available = True
+            self.refresh_tray_menu_state()
+            Gtk.main()
+        except Exception as exc:  # pylint: disable=broad-except
+            self.tray_available = False
+            self.log(f"System tray initialization failed: {exc}")
+
+    def _tray_toggle_label(self) -> str:
+        return "Disconnect" if (self.is_busy or self.is_connected()) else "Connect"
+
+    def refresh_tray_menu_state(self) -> None:
+        if not self.tray_available or self.tray_toggle_item is None or GLib is None:
+            return
+        label = self._tray_toggle_label()
+
+        def _apply() -> bool:
+            if self.tray_toggle_item is not None:
+                self.tray_toggle_item.set_label(label)
+            return False
+
+        GLib.idle_add(_apply)
+
+    def _tray_on_show(self, *_args: object) -> None:
+        self.root.after(0, self.show_window)
+
+    def _tray_on_toggle(self, *_args: object) -> None:
+        self.root.after(0, self.toggle_connection)
+
+    def _tray_on_exit(self, *_args: object) -> None:
+        self.root.after(0, self.exit_application)
+
+    def _tray_on_popup(self, icon_obj: object, button: int, activate_time: int) -> None:
+        if self.tray_menu is None or Gtk is None:
+            return
+        self.tray_menu.popup(None, None, Gtk.StatusIcon.position_menu, icon_obj, button, activate_time)
+
+    def show_window(self) -> None:
+        self.root.deiconify()
+        self.root.lift()
+        try:
+            self.root.focus_force()
+        except Exception:
+            pass
+
+    def hide_window_to_tray(self) -> None:
+        self.root.withdraw()
+        self.log("Window hidden to tray.")
+
+    def stop_tray_icon(self) -> None:
+        if not self.tray_available or GLib is None or Gtk is None:
+            return
+
+        def _quit() -> bool:
+            try:
+                if self.tray_icon is not None:
+                    self.tray_icon.set_visible(False)
+            except Exception:
+                pass
+            try:
+                Gtk.main_quit()
+            except Exception:
+                pass
+            return False
+
+        self.tray_available = False
+        GLib.idle_add(_quit)
+
+    def exit_application(self) -> None:
+        if self.is_exiting:
+            return
+        self.is_exiting = True
+        if not sys.platform.startswith("linux"):
+            self.disconnect()
+        elif self.is_busy:
+            self._request_cancel()
+        self.stop_tray_icon()
+        self.root.destroy()
+
+    def prepare_icon_assets(self) -> None:
+        if not self.icon_source_path.exists() or not PIL_AVAILABLE or Image is None:
+            return
+        try:
+            self.linux_state_dir.mkdir(parents=True, exist_ok=True)
+            image = Image.open(self.icon_source_path).convert("RGBA")
+            image = image.resize((256, 256), RESAMPLE_LANCZOS)
+            image.save(self.icon_png_path, format="PNG")
+        except Exception:
+            pass
+
+    def _chown_for_user(self, path: Path, uid: int, gid: int) -> None:
+        if os.geteuid() != 0:
+            return
+        try:
+            os.chown(path, uid, gid)
+        except OSError:
+            pass
+
+    def ensure_desktop_entry(self) -> None:
+        if not sys.platform.startswith("linux"):
+            return
+
+        user = self.determine_ws_user()
+        try:
+            pw_record = pwd.getpwnam(user)
+        except KeyError:
+            return
+
+        home = Path(pw_record.pw_dir)
+        uid = pw_record.pw_uid
+        gid = pw_record.pw_gid
+        apps_dir = home / ".local" / "share" / "applications"
+        icons_dir = home / ".local" / "share" / "icons" / "hicolor" / "256x256" / "apps"
+        desktop_file = apps_dir / DESKTOP_ENTRY_FILENAME
+        icon_file = icons_dir / f"{DESKTOP_ICON_BASENAME}.png"
+
+        try:
+            apps_dir.mkdir(parents=True, exist_ok=True)
+            icons_dir.mkdir(parents=True, exist_ok=True)
+            self._chown_for_user(apps_dir, uid, gid)
+            self._chown_for_user(icons_dir, uid, gid)
+        except OSError as exc:
+            self.log(f"Failed to prepare desktop entry directories: {exc}")
+            return
+
+        if PIL_AVAILABLE and Image is not None and self.icon_source_path.exists():
+            try:
+                image = Image.open(self.icon_source_path).convert("RGBA")
+                image = image.resize((256, 256), RESAMPLE_LANCZOS)
+                image.save(icon_file, format="PNG")
+            except Exception as exc:  # pylint: disable=broad-except
+                self.log(f"Failed to export menu icon: {exc}")
+        elif self.icon_png_path.exists():
+            try:
+                shutil.copy2(self.icon_png_path, icon_file)
+            except OSError as exc:
+                self.log(f"Failed to copy menu icon: {exc}")
+
+        self._chown_for_user(icon_file, uid, gid)
+
+        exec_path = self.app_dir / "run-ubuntu-gui.sh"
+        icon_value = str(icon_file) if icon_file.exists() else DESKTOP_ICON_BASENAME
+        entry_text = (
+            "[Desktop Entry]\n"
+            "Version=1.0\n"
+            "Type=Application\n"
+            "Name=Zapret\n"
+            "Comment=Zapret Launcher\n"
+            f"Exec={exec_path}\n"
+            f"Path={self.app_dir}\n"
+            f"Icon={icon_value}\n"
+            f"StartupWMClass={APP_WM_CLASS}\n"
+            "Terminal=false\n"
+            "Categories=Network;Utility;\n"
+            "StartupNotify=true\n"
+        )
+
+        try:
+            desktop_file.write_text(entry_text, encoding="utf-8")
+            os.chmod(desktop_file, 0o644)
+            self._chown_for_user(desktop_file, uid, gid)
+        except OSError as exc:
+            self.log(f"Failed to write desktop entry: {exc}")
+
     def toggle_connection(self) -> None:
         if not self.strategies_map:
             self.log("No strategy available.")
             return
+        if sys.platform.startswith("linux") and not self.is_busy:
+            self.service_active_cached = self.is_service_active()
         if self.is_busy or self.is_connected():
             self.disconnect()
         else:
@@ -878,18 +1207,66 @@ class ZapretGuiApp:
     def refresh_autostart_state_async(self) -> None:
         threading.Thread(target=self.refresh_autostart_state, daemon=True).start()
 
+    def ensure_managed_service_async(self) -> None:
+        if not sys.platform.startswith("linux"):
+            return
+        threading.Thread(target=self.ensure_managed_service, daemon=True).start()
+
+    def managed_service_exists(self) -> bool:
+        return self.autostart_system_unit.exists() or self.autostart_local_unit.exists()
+
+    def ensure_managed_service(self) -> None:
+        if not sys.platform.startswith("linux"):
+            return
+        if self.managed_service_exists():
+            return
+
+        strategy_name = self.strategy_var.get().strip()
+        strategy = self.strategies_map.get(strategy_name)
+        if strategy is None:
+            self.log("Cannot create systemd service: no strategy selected.")
+            return
+        if strategy.kind != "bat":
+            self.log("Cannot create systemd service: only .bat alternatives are supported.")
+            return
+
+        try:
+            self.log("Managed service not found. Creating systemd service...")
+            self.install_or_update_managed_service(strategy)
+            self.log(f"Managed service created for {strategy.name}.")
+        except Exception as exc:  # pylint: disable=broad-except
+            self.log(f"[ERROR] Failed to create managed service: {exc}")
+        finally:
+            self.refresh_autostart_state_async()
+
     def refresh_autostart_state(self) -> None:
         enabled = self.is_autostart_enabled()
-        strategy = self.read_autostart_strategy_name() if enabled else ""
+        active = self.is_service_active()
+        strategy = self.read_autostart_strategy_name() if (enabled or active or self.managed_service_exists()) else ""
 
         def _apply() -> None:
             self.set_autostart_cache(enabled, strategy)
+            self.service_active_cached = active
             self.autostart_update_in_progress = True
             self.autostart_var.set(1 if enabled else 0)
             self.autostart_update_in_progress = False
             self.update_autostart_info_label_sync()
+            if not self.is_busy:
+                self.status_var.set("Connected" if active else "Idle")
+                self.refresh_action_button()
 
         self.root.after(0, _apply)
+
+    def is_service_active(self) -> bool:
+        if not sys.platform.startswith("linux"):
+            return False
+        rc, output = self.run_command_capture(
+            ["systemctl", "is-active", AUTOSTART_SERVICE_NAME],
+            cwd=self.app_dir,
+        )
+        if rc != 0:
+            return False
+        return output.splitlines()[0].strip() == "active" if output else False
 
     def is_autostart_enabled(self) -> bool:
         if not sys.platform.startswith("linux"):
@@ -999,18 +1376,18 @@ class ZapretGuiApp:
         )
         self.autostart_local_unit.write_text(unit_text, encoding="utf-8")
 
-    def enable_autostart_service(self, strategy: Strategy) -> None:
+    def install_or_update_managed_service(self, strategy: Strategy) -> None:
         if not sys.platform.startswith("linux"):
-            raise RuntimeError("Autostart via systemd is supported only on Linux.")
+            raise RuntimeError("Managed service is supported only on Linux.")
         if strategy.kind != "bat":
-            raise RuntimeError("Autostart is supported only for .bat alternatives on Linux backend.")
+            raise RuntimeError("Managed service supports only .bat alternatives on Linux backend.")
         if " " in str(self.source_dir.resolve()):
             raise RuntimeError("Project path contains spaces. Move project to a path without spaces.")
 
-        self.log("Preparing autostart service for selected alternative...")
+        self.log("Preparing managed systemd service for selected alternative...")
         self.ensure_linux_backend()
         config_path = self.generate_linux_config_from_bat(strategy.path, output_path=self.autostart_config_file)
-        self.log(f"Generated autostart config: {config_path}")
+        self.log(f"Generated service config: {config_path}")
         self.write_autostart_unit(config_path, strategy)
         self.autostart_strategy_file.write_text(f"{strategy.name}\n", encoding="utf-8")
 
@@ -1024,16 +1401,23 @@ class ZapretGuiApp:
             ]
         )
         reload_cmd = self.elevate_command(["systemctl", "daemon-reload"])
-        enable_cmd = self.elevate_command(["systemctl", "enable", "--now", AUTOSTART_SERVICE_NAME])
 
         self.run_logged_command(install_cmd, cwd=self.app_dir)
         self.run_logged_command(reload_cmd, cwd=self.app_dir)
+
+    def enable_autostart_service(self, strategy: Strategy) -> None:
+        if not self.managed_service_exists():
+            self.install_or_update_managed_service(strategy)
+        elif self.read_autostart_strategy_name() != strategy.name:
+            self.install_or_update_managed_service(strategy)
+
+        enable_cmd = self.elevate_command(["systemctl", "enable", AUTOSTART_SERVICE_NAME])
         self.run_logged_command(enable_cmd, cwd=self.app_dir)
 
     def disable_autostart_service(self) -> None:
         if not sys.platform.startswith("linux"):
             return
-        disable_cmd = self.elevate_command(["systemctl", "disable", "--now", AUTOSTART_SERVICE_NAME])
+        disable_cmd = self.elevate_command(["systemctl", "disable", AUTOSTART_SERVICE_NAME])
         rc, output = self.run_command_capture(disable_cmd, cwd=self.app_dir)
         if output:
             for line in output.splitlines():
@@ -1044,6 +1428,27 @@ class ZapretGuiApp:
             benign = ("not loaded", "not-found", "does not exist", "no such file")
             if not any(token in lowered for token in benign):
                 raise RuntimeError(f"systemctl disable failed with code {rc}.")
+
+    def start_managed_service(self, strategy: Strategy) -> None:
+        service_strategy = self.read_autostart_strategy_name()
+        if not self.managed_service_exists() or service_strategy != strategy.name:
+            self.install_or_update_managed_service(strategy)
+
+        start_cmd = self.elevate_command(["systemctl", "start", AUTOSTART_SERVICE_NAME])
+        self.run_logged_command(start_cmd, cwd=self.app_dir)
+
+    def stop_managed_service(self) -> None:
+        stop_cmd = self.elevate_command(["systemctl", "stop", AUTOSTART_SERVICE_NAME])
+        rc, output = self.run_command_capture(stop_cmd, cwd=self.app_dir)
+        if output:
+            for line in output.splitlines():
+                if line.strip():
+                    self.log(line.strip())
+        if rc != 0:
+            lowered = output.lower()
+            benign = ("not loaded", "not-found", "does not exist", "no such file")
+            if not any(token in lowered for token in benign):
+                raise RuntimeError(f"systemctl stop failed with code {rc}.")
 
     def ensure_user_lists(self) -> None:
         lists_dir = self.source_dir / "lists"
@@ -1366,6 +1771,35 @@ class ZapretGuiApp:
         self.run_logged_command(command, cwd=self.app_dir, env=env)
 
     def connect(self) -> None:
+        if sys.platform.startswith("linux"):
+            if self.is_busy:
+                if self.busy_operation == "service-stop":
+                    self.log("Service stop is in progress.")
+                else:
+                    self.log("Another operation is already in progress.")
+                return
+
+            strategy_name = self.strategy_var.get().strip()
+            if not strategy_name:
+                self.log("No strategy selected.")
+                return
+
+            strategy = self.strategies_map.get(strategy_name)
+            if strategy is None:
+                self.log(f"Selected strategy does not exist: {strategy_name}")
+                return
+            if strategy.kind != "bat":
+                self.log("Only .bat alternatives are supported in Linux systemd mode.")
+                return
+
+            self.last_selected_strategy = strategy
+            self.is_busy = True
+            self.busy_operation = "service-start"
+            self.set_status("Starting...")
+            self.refresh_action_button()
+            threading.Thread(target=self._connect_via_systemd_worker, args=(strategy,), daemon=True).start()
+            return
+
         if self.is_busy:
             self.disconnect()
             return
@@ -1390,6 +1824,27 @@ class ZapretGuiApp:
         self.set_status("Connecting...")
         self.refresh_action_button()
         threading.Thread(target=self._connect_worker, args=(strategy,), daemon=True).start()
+
+    def _connect_via_systemd_worker(self, strategy: Strategy) -> None:
+        try:
+            self.ensure_user_lists()
+            self.start_managed_service(strategy)
+            self.log(f"Service started with {strategy.name}.")
+        except OperationCancelled:
+            self.log("Connection start cancelled.")
+            try:
+                self.stop_managed_service()
+            except Exception:
+                pass
+        except Exception as exc:  # pylint: disable=broad-except
+            self.set_status("Error")
+            self.log(f"[ERROR] {exc}")
+        finally:
+            self.is_busy = False
+            self.busy_operation = None
+            self.cancel_requested = False
+            self.refresh_autostart_state_async()
+            self.root.after(0, self.refresh_action_button)
 
     def _connect_worker(self, strategy: Strategy) -> None:
         strategy_name = strategy.name
@@ -1505,6 +1960,33 @@ class ZapretGuiApp:
         self.root.after(0, on_exit)
 
     def disconnect(self) -> None:
+        if sys.platform.startswith("linux"):
+            if self.is_busy:
+                if self.busy_operation == "service-start":
+                    if not self.cancel_requested:
+                        self.set_status("Stopping...")
+                        self.log("Stopping current connection operation...")
+                        self._request_cancel()
+                    self.refresh_action_button()
+                    return
+                if self.busy_operation == "service-stop":
+                    if not self.cancel_requested:
+                        self.set_status("Stopping...")
+                        self.log("Stopping current stop operation...")
+                        self._request_cancel()
+                    self.refresh_action_button()
+                    return
+                self.log("Another operation is already in progress.")
+                return
+
+            self.is_busy = True
+            self.busy_operation = "service-stop"
+            self.cancel_requested = False
+            self.set_status("Stopping...")
+            self.refresh_action_button()
+            threading.Thread(target=self._disconnect_via_systemd_worker, daemon=True).start()
+            return
+
         if self.is_busy and self.busy_operation == "connect":
             if not self.cancel_requested:
                 self.set_status("Stopping...")
@@ -1546,6 +2028,22 @@ class ZapretGuiApp:
             self.set_status("Idle")
             self.log("Disconnected.")
             self.refresh_action_button()
+
+    def _disconnect_via_systemd_worker(self) -> None:
+        try:
+            self.stop_managed_service()
+            self.log("Service stopped.")
+        except OperationCancelled:
+            self.log("Service stop cancelled.")
+        except Exception as exc:  # pylint: disable=broad-except
+            self.set_status("Error")
+            self.log(f"[ERROR] {exc}")
+        finally:
+            self.is_busy = False
+            self.busy_operation = None
+            self.cancel_requested = False
+            self.refresh_autostart_state_async()
+            self.root.after(0, self.refresh_action_button)
 
     def parse_update_sources(self) -> tuple[str, str, str]:
         version_url = FALLBACK_VERSION_URL
@@ -1699,12 +2197,14 @@ class ZapretGuiApp:
             return False
 
     def on_close(self) -> None:
-        self.disconnect()
-        self.root.destroy()
+        if self.tray_available and not self.is_exiting:
+            self.hide_window_to_tray()
+            return
+        self.exit_application()
 
 
 def main() -> None:
-    root = Tk()
+    root = Tk(className=APP_WM_CLASS)
     app = ZapretGuiApp(root=root, app_dir=Path(__file__).resolve().parent)
     app.log(f"Source directory: {app.source_dir}")
     app.log(f"Launcher started. Log file: {app.log_file}")
