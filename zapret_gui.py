@@ -83,6 +83,7 @@ class ZapretGuiApp:
         self.linux_generated_config = self.linux_state_dir / "config.generated"
         self.selected_strategy_file = self.linux_state_dir / "selected_strategy.txt"
         self.autostart_config_file = self.linux_state_dir / "config.autostart.generated"
+        self.autostart_strategy_file = self.linux_state_dir / "autostart_strategy.txt"
         self.autostart_local_unit = self.linux_state_dir / AUTOSTART_SERVICE_NAME
         self.autostart_system_unit = Path("/etc/systemd/system") / AUTOSTART_SERVICE_NAME
         self.logs_dir = self.linux_root / "logs"
@@ -101,9 +102,12 @@ class ZapretGuiApp:
         self.autostart_check: ttk.Checkbutton | None = None
         self.autostart_busy = False
         self.autostart_update_in_progress = False
+        self.autostart_enabled_cached = False
+        self.autostart_strategy_cached = ""
 
         self.strategy_var = StringVar()
         self.autostart_var = IntVar(value=0)
+        self.autostart_info_var = StringVar(value="Autostart: off")
         self.status_var = StringVar(value="Idle")
         self.local_version = self.read_local_version()
         self.version_badge_var = StringVar(value=f"v{self.local_version} · checking...")
@@ -415,6 +419,13 @@ class ZapretGuiApp:
             command=self.on_autostart_toggled,
         )
         self.autostart_check.pack(anchor="center")
+        ttk.Label(
+            autostart_row,
+            textvariable=self.autostart_info_var,
+            style="InfoCaption.TLabel",
+            justify="center",
+            wraplength=340,
+        ).pack(anchor="center", pady=(2, 0))
 
         footer = ttk.Frame(app, style="Card.TFrame", padding=(14, 12))
         footer.pack(fill="x", pady=(8, 0), padx=(0, 0), side="bottom")
@@ -766,6 +777,7 @@ class ZapretGuiApp:
             if self.action_canvas is not None:
                 self.action_canvas.configure(state="disabled")
             self.refresh_action_button()
+            self.update_autostart_info_label()
             if not quiet:
                 self.log("No strategy files found (expected general*.bat or general*.sh).")
             return
@@ -786,6 +798,7 @@ class ZapretGuiApp:
         bat_count = sum(1 for item in found if item.kind == "bat")
         sh_count = sum(1 for item in found if item.kind == "sh")
         self.refresh_action_button()
+        self.update_autostart_info_label()
         if not quiet:
             self.log(f"Loaded {len(found)} strategy file(s): .bat={bat_count}, .sh={sh_count}")
 
@@ -795,6 +808,7 @@ class ZapretGuiApp:
             return
         self.last_selected_strategy_name = selected
         self.save_selected_strategy_name(selected)
+        self.update_autostart_info_label()
 
     def load_selected_strategy_name(self) -> str:
         try:
@@ -821,6 +835,38 @@ class ZapretGuiApp:
 
         self.root.after(0, _apply)
 
+    def compose_autostart_info(self, enabled: bool, service_strategy: str) -> str:
+        if not enabled:
+            return "Autostart: off"
+        clean_service = service_strategy.strip()
+        if not clean_service:
+            return "Autostart: enabled (unknown alternative)"
+        selected = self.strategy_var.get().strip()
+        if selected and selected != clean_service:
+            return f"Autostart: {clean_service} (selected: {selected})"
+        return f"Autostart: {clean_service}"
+
+    def set_autostart_cache(self, enabled: bool, service_strategy: str) -> None:
+        self.autostart_enabled_cached = enabled
+        self.autostart_strategy_cached = service_strategy.strip()
+
+    def update_autostart_info_label(self) -> None:
+        def _apply() -> None:
+            text = self.compose_autostart_info(
+                self.autostart_enabled_cached,
+                self.autostart_strategy_cached,
+            )
+            self.autostart_info_var.set(text)
+
+        self.root.after(0, _apply)
+
+    def update_autostart_info_label_sync(self) -> None:
+        text = self.compose_autostart_info(
+            self.autostart_enabled_cached,
+            self.autostart_strategy_cached,
+        )
+        self.autostart_info_var.set(text)
+
     def set_autostart_check_enabled(self, enabled: bool) -> None:
         def _apply() -> None:
             if self.autostart_check is None or not self.autostart_check.winfo_exists():
@@ -834,7 +880,16 @@ class ZapretGuiApp:
 
     def refresh_autostart_state(self) -> None:
         enabled = self.is_autostart_enabled()
-        self.set_autostart_var_safely(enabled)
+        strategy = self.read_autostart_strategy_name() if enabled else ""
+
+        def _apply() -> None:
+            self.set_autostart_cache(enabled, strategy)
+            self.autostart_update_in_progress = True
+            self.autostart_var.set(1 if enabled else 0)
+            self.autostart_update_in_progress = False
+            self.update_autostart_info_label_sync()
+
+        self.root.after(0, _apply)
 
     def is_autostart_enabled(self) -> bool:
         if not sys.platform.startswith("linux"):
@@ -846,6 +901,23 @@ class ZapretGuiApp:
         if rc != 0:
             return False
         return output.splitlines()[0].strip() == "enabled" if output else False
+
+    def read_autostart_strategy_name(self) -> str:
+        desc_pattern = re.compile(r"^Description=Zapret Discord Autostart\s*\((.+)\)\s*$")
+        for candidate in (self.autostart_system_unit, self.autostart_local_unit):
+            try:
+                text = candidate.read_text(encoding="utf-8", errors="ignore")
+            except OSError:
+                continue
+            for line in text.splitlines():
+                match = desc_pattern.match(line.strip())
+                if match:
+                    return match.group(1).strip()
+
+        try:
+            return self.autostart_strategy_file.read_text(encoding="utf-8").strip()
+        except OSError:
+            return ""
 
     def on_autostart_toggled(self) -> None:
         if self.autostart_update_in_progress:
@@ -877,9 +949,13 @@ class ZapretGuiApp:
                     raise RuntimeError("Select a strategy before enabling autostart.")
                 self.enable_autostart_service(strategy)
                 self.log(f"Autostart enabled for {strategy.name}.")
+                self.set_autostart_cache(True, strategy.name)
+                self.update_autostart_info_label()
             else:
                 self.disable_autostart_service()
                 self.log("Autostart disabled.")
+                self.set_autostart_cache(False, "")
+                self.update_autostart_info_label()
         except Exception as exc:  # pylint: disable=broad-except
             self.log(f"[ERROR] Failed to update autostart: {exc}")
         finally:
@@ -936,6 +1012,7 @@ class ZapretGuiApp:
         config_path = self.generate_linux_config_from_bat(strategy.path, output_path=self.autostart_config_file)
         self.log(f"Generated autostart config: {config_path}")
         self.write_autostart_unit(config_path, strategy)
+        self.autostart_strategy_file.write_text(f"{strategy.name}\n", encoding="utf-8")
 
         install_cmd = self.elevate_command(
             [
