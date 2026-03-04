@@ -1188,8 +1188,68 @@ class ZapretGuiApp:
         if not self.download_url:
             self.log("Release URL is not available.")
             return
-        webbrowser.open(self.download_url)
-        self.log(f"Opened: {self.download_url}")
+        url = self.download_url
+        opened = False
+
+        if os.geteuid() == 0:
+            opened = self._open_url_as_desktop_user(url)
+            if not opened:
+                self.log("Failed to open release page via desktop user context, trying default browser fallback...")
+
+        if not opened:
+            try:
+                opened = webbrowser.open(url)
+            except Exception:
+                opened = False
+
+        if opened:
+            self.log(f"Opened: {url}")
+            return
+
+        self.log(f"Could not open browser automatically. Open manually: {url}")
+
+    def _open_url_as_desktop_user(self, url: str) -> bool:
+        user = self.determine_ws_user()
+        if not user or user == "root":
+            return False
+
+        xdg_open = shutil.which("xdg-open")
+        sudo_bin = shutil.which("sudo")
+        if xdg_open is None or sudo_bin is None:
+            return False
+
+        try:
+            pw_record = pwd.getpwnam(user)
+        except KeyError:
+            return False
+
+        uid = pw_record.pw_uid
+        home = pw_record.pw_dir
+        runtime_dir = os.environ.get("XDG_RUNTIME_DIR", f"/run/user/{uid}")
+
+        env_args = [f"HOME={home}", f"XDG_RUNTIME_DIR={runtime_dir}"]
+        for name in ("DISPLAY", "WAYLAND_DISPLAY", "XAUTHORITY", "DBUS_SESSION_BUS_ADDRESS"):
+            value = os.environ.get(name, "").strip()
+            if value:
+                env_args.append(f"{name}={value}")
+
+        bus_path = Path(runtime_dir) / "bus"
+        has_bus_var = any(item.startswith("DBUS_SESSION_BUS_ADDRESS=") for item in env_args)
+        if not has_bus_var and bus_path.exists():
+            env_args.append(f"DBUS_SESSION_BUS_ADDRESS=unix:path={bus_path}")
+
+        command = [sudo_bin, "-u", user, "--", "env", *env_args, xdg_open, url]
+        try:
+            subprocess.Popen(
+                command,
+                cwd=self.base_dir,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                start_new_session=True,
+            )
+            return True
+        except Exception:
+            return False
 
     def on_close(self) -> None:
         self.disconnect()
