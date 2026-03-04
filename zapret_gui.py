@@ -80,8 +80,12 @@ class ZapretGuiApp:
         self.log_text: ScrolledText | None = None
         self.log_history: list[str] = []
         self.action_canvas: Canvas | None = None
+        self.action_glow_outer_id: int | None = None
+        self.action_glow_inner_id: int | None = None
+        self.action_ring_id: int | None = None
         self.action_circle_id: int | None = None
         self.action_text_id: int | None = None
+        self.action_hovered = False
 
         self.strategy_var = StringVar()
         self.status_var = StringVar(value="Idle")
@@ -100,17 +104,21 @@ class ZapretGuiApp:
 
     def _setup_style(self) -> None:
         self.root.title("Zapret")
-        self.root.geometry("720x520")
-        self.root.minsize(640, 460)
+        self.root.geometry("430x760")
+        self.root.minsize(390, 680)
 
         self.palette = {
-            "bg": "#edf2f8",
-            "card": "#ffffff",
-            "text": "#16253b",
-            "muted": "#5d6e8a",
-            "accent": "#0f6fff",
-            "accent_hover": "#0d61e1",
-            "accent_pressed": "#0b52be",
+            "bg": "#060912",
+            "card": "#111827",
+            "card_alt": "#151d2e",
+            "text": "#f4f7ff",
+            "muted": "#6d7b9a",
+            "accent": "#ffb561",
+            "accent_hover": "#ffc883",
+            "accent_pressed": "#ef9f49",
+            "danger": "#ff5f8a",
+            "danger_hover": "#ff7aa2",
+            "border": "#242d40",
         }
         self.root.configure(bg=self.palette["bg"])
 
@@ -119,18 +127,23 @@ class ZapretGuiApp:
             style.theme_use("clam")
 
         style.configure("App.TFrame", background=self.palette["bg"])
-        style.configure("Card.TFrame", background=self.palette["card"], relief="flat")
+        style.configure(
+            "Card.TFrame",
+            background=self.palette["card"],
+            relief="flat",
+            borderwidth=1,
+        )
         style.configure(
             "Field.TLabel",
-            background=self.palette["card"],
-            foreground=self.palette["text"],
-            font=("Ubuntu", 10),
+            background=self.palette["bg"],
+            foreground=self.palette["muted"],
+            font=("Ubuntu", 11),
         )
         style.configure(
             "InfoCaption.TLabel",
-            background=self.palette["card"],
+            background=self.palette["bg"],
             foreground=self.palette["muted"],
-            font=("Ubuntu", 9),
+            font=("Ubuntu", 10),
         )
         style.configure(
             "InfoValue.TLabel",
@@ -138,121 +151,128 @@ class ZapretGuiApp:
             foreground=self.palette["text"],
             font=("Ubuntu", 10, "bold"),
         )
-
         style.configure(
-            "Primary.TButton",
-            font=("Ubuntu", 11, "bold"),
-            foreground="#ffffff",
-            background=self.palette["accent"],
-            borderwidth=0,
-            focusthickness=0,
-            padding=(18, 10),
-        )
-        style.map(
-            "Primary.TButton",
-            background=[
-                ("pressed", self.palette["accent_pressed"]),
-                ("active", self.palette["accent_hover"]),
-            ],
+            "Status.TLabel",
+            background=self.palette["bg"],
+            foreground="#8d9abc",
+            font=("Ubuntu", 10),
         )
 
         style.configure(
             "Secondary.TButton",
-            font=("Ubuntu", 10, "bold"),
+            font=("Ubuntu", 10),
             foreground=self.palette["text"],
-            background="#dde5f2",
+            background=self.palette["card_alt"],
             borderwidth=0,
             focusthickness=0,
-            padding=(14, 9),
+            relief="flat",
+            padding=(12, 8),
         )
         style.map(
             "Secondary.TButton",
             background=[
-                ("pressed", "#c9d5e9"),
-                ("active", "#d2dced"),
+                ("pressed", "#1c2537"),
+                ("active", "#1a2233"),
             ],
+            foreground=[("active", self.palette["accent_hover"])],
         )
 
         style.configure(
             "Ghost.TButton",
             font=("Ubuntu", 10),
-            foreground=self.palette["text"],
+            foreground=self.palette["muted"],
             background=self.palette["card"],
             borderwidth=0,
             focusthickness=0,
+            relief="flat",
             padding=(8, 8),
         )
         style.map(
             "Ghost.TButton",
-            foreground=[("active", self.palette["accent"])],
-            background=[("active", "#f2f6ff")],
+            foreground=[("active", self.palette["accent_hover"])],
+            background=[("active", self.palette["card"])],
         )
 
         style.configure(
             "App.TCombobox",
-            padding=7,
+            padding=10,
             arrowsize=16,
-            fieldbackground="#f8fbff",
-            background="#f8fbff",
+            fieldbackground=self.palette["card_alt"],
+            background=self.palette["card_alt"],
             foreground=self.palette["text"],
-            selectbackground="#dce9ff",
-            selectforeground=self.palette["text"],
-            bordercolor="#d6deea",
-            lightcolor="#d6deea",
-            darkcolor="#d6deea",
+            selectbackground="#23314c",
+            selectforeground="#ffffff",
+            bordercolor=self.palette["border"],
+            lightcolor=self.palette["border"],
+            darkcolor=self.palette["border"],
             relief="flat",
+        )
+        style.map(
+            "App.TCombobox",
+            fieldbackground=[("readonly", self.palette["card_alt"])],
+            selectbackground=[("readonly", "#23314c")],
         )
 
     def _build_ui(self) -> None:
-        app = ttk.Frame(self.root, style="App.TFrame", padding=(18, 16))
+        app = ttk.Frame(self.root, style="App.TFrame", padding=(16, 14))
         app.pack(fill="both", expand=True)
 
-        card = ttk.Frame(app, style="Card.TFrame", padding=(20, 16))
-        card.pack(fill="both", expand=True)
-
-        center = ttk.Frame(card, style="Card.TFrame")
+        center = ttk.Frame(app, style="App.TFrame")
         center.pack(fill="both", expand=True)
+
+        top_spacer = ttk.Frame(center, style="App.TFrame")
+        top_spacer.pack(fill="x", pady=(8, 12))
 
         self.action_canvas = Canvas(
             center,
-            width=236,
-            height=236,
-            bg=self.palette["card"],
+            width=332,
+            height=332,
+            bg=self.palette["bg"],
             highlightthickness=0,
             bd=0,
             cursor="hand2",
         )
-        self.action_canvas.pack(pady=(6, 6))
+        self.action_canvas.pack(pady=(12, 2))
+        self.action_glow_outer_id = self.action_canvas.create_oval(
+            62, 62, 270, 270, outline="#2a2f3d", width=16
+        )
+        self.action_glow_inner_id = self.action_canvas.create_oval(
+            68, 68, 264, 264, outline="#3b4255", width=8
+        )
         self.action_circle_id = self.action_canvas.create_oval(
-            10, 10, 226, 226, fill=self.palette["accent"], outline=""
+            84, 84, 248, 248, fill=self.palette["bg"], outline=""
+        )
+        self.action_ring_id = self.action_canvas.create_oval(
+            76, 76, 256, 256, outline=self.palette["accent"], width=2
         )
         self.action_text_id = self.action_canvas.create_text(
-            118,
-            118,
+            166,
+            166,
             text="Connect",
-            fill="#ffffff",
-            font=("Ubuntu", 22, "bold"),
+            fill=self.palette["accent_hover"],
+            font=("Ubuntu", 27, "bold"),
         )
         self.action_canvas.bind("<Button-1>", lambda _event: self.toggle_connection())
         self.action_canvas.bind("<Enter>", lambda _event: self._action_hover(True))
         self.action_canvas.bind("<Leave>", lambda _event: self._action_hover(False))
 
-        ttk.Label(center, textvariable=self.status_var, style="InfoCaption.TLabel").pack(pady=(2, 10))
+        ttk.Label(center, textvariable=self.status_var, style="Status.TLabel").pack(pady=(2, 14))
 
-        chooser = ttk.Frame(card, style="Card.TFrame")
-        chooser.pack(fill="x", pady=(4, 0))
-        ttk.Label(chooser, text="Alternative", style="Field.TLabel").pack(anchor="w", pady=(0, 6))
+        chooser = ttk.Frame(center, style="App.TFrame")
+        chooser.pack(fill="x", pady=(8, 18), padx=(14, 14))
+        ttk.Label(chooser, text="Alternative", style="Field.TLabel").pack(anchor="center", pady=(0, 7))
         self.strategy_combo = ttk.Combobox(
             chooser,
             textvariable=self.strategy_var,
             style="App.TCombobox",
             state="readonly",
             postcommand=lambda: self.refresh_strategies(quiet=True),
+            justify="center",
         )
         self.strategy_combo.pack(fill="x")
 
-        footer = ttk.Frame(app, style="Card.TFrame", padding=(14, 10))
-        footer.pack(fill="x", pady=(10, 0))
+        footer = ttk.Frame(app, style="Card.TFrame", padding=(14, 12))
+        footer.pack(fill="x", pady=(8, 0), padx=(0, 0), side="bottom")
 
         ttk.Label(footer, textvariable=self.version_badge_var, style="InfoValue.TLabel").pack(side="left")
         self.open_update_button = ttk.Button(
@@ -289,6 +309,84 @@ class ZapretGuiApp:
     def log(self, message: str) -> None:
         self.root.after(0, self.append_log, message)
 
+    @staticmethod
+    def _hex_to_rgb(color: str) -> tuple[int, int, int]:
+        value = color.lstrip("#")
+        return int(value[0:2], 16), int(value[2:4], 16), int(value[4:6], 16)
+
+    def _mix_color(self, left: str, right: str, factor: float) -> str:
+        t = max(0.0, min(1.0, factor))
+        lr, lg, lb = self._hex_to_rgb(left)
+        rr, rg, rb = self._hex_to_rgb(right)
+        r = round(lr + (rr - lr) * t)
+        g = round(lg + (rg - lg) * t)
+        b = round(lb + (rb - lb) * t)
+        return f"#{r:02x}{g:02x}{b:02x}"
+
+    def _action_theme(self) -> dict[str, str]:
+        if not self.strategies_map:
+            return {
+                "label": "No strategy",
+                "fill": "#101623",
+                "text": "#7384a6",
+                "ring": "#3f4960",
+                "glow": "#2f3b52",
+                "cursor": "arrow",
+            }
+        if self.is_busy:
+            busy_label = "Stopping..." if self.cancel_requested else "Connecting..."
+            return {
+                "label": busy_label,
+                "fill": "#221824",
+                "text": "#ffdbe8",
+                "ring": self.palette["danger_hover"],
+                "glow": self.palette["danger"],
+                "cursor": "hand2",
+            }
+        if self.is_connected():
+            return {
+                "label": "Connected",
+                "fill": "#0d101a",
+                "text": self.palette["accent"],
+                "ring": self.palette["accent_hover"],
+                "glow": self.palette["accent"],
+                "cursor": "hand2",
+            }
+        return {
+            "label": "Connect",
+            "fill": "#0d101a",
+            "text": "#b3bdd1",
+            "ring": "#65708a",
+            "glow": "#3a445a",
+            "cursor": "hand2",
+        }
+
+    def _render_action_button(self) -> None:
+        if (
+            self.action_canvas is None
+            or self.action_glow_outer_id is None
+            or self.action_glow_inner_id is None
+            or self.action_ring_id is None
+            or self.action_circle_id is None
+            or self.action_text_id is None
+        ):
+            return
+
+        theme = self._action_theme()
+        hover_bonus = 0.12 if self.action_hovered and self.strategies_map else 0.0
+
+        outer_outline = self._mix_color(self.palette["bg"], theme["glow"], 0.38 + hover_bonus)
+        inner_outline = self._mix_color(self.palette["bg"], theme["glow"], 0.64 + hover_bonus)
+        ring_outline = self._mix_color(theme["ring"], "#ffffff", 0.18 + hover_bonus)
+        fill_color = self._mix_color(theme["fill"], self.palette["bg"], 0.12)
+
+        self.action_canvas.configure(cursor=theme["cursor"])
+        self.action_canvas.itemconfigure(self.action_glow_outer_id, outline=outer_outline, width=13)
+        self.action_canvas.itemconfigure(self.action_glow_inner_id, outline=inner_outline, width=6)
+        self.action_canvas.itemconfigure(self.action_ring_id, outline=ring_outline, width=2)
+        self.action_canvas.itemconfigure(self.action_circle_id, fill=fill_color)
+        self.action_canvas.itemconfigure(self.action_text_id, text=theme["label"], fill=theme["text"])
+
     def _terminate_subprocess(self, proc: subprocess.Popen[str]) -> None:
         if proc.poll() is not None:
             return
@@ -316,40 +414,11 @@ class ZapretGuiApp:
         return self.process is not None and self.process.poll() is None
 
     def refresh_action_button(self) -> None:
-        if self.action_canvas is None or self.action_circle_id is None or self.action_text_id is None:
-            return
-
-        if not self.strategies_map:
-            fill = "#b7c4d8"
-            text = "No strategy"
-        elif self.is_busy:
-            fill = "#f25566"
-            text = "Disconnect"
-        elif self.is_connected():
-            fill = "#f25566"
-            text = "Disconnect"
-        else:
-            fill = self.palette["accent"]
-            text = "Connect"
-
-        self.action_canvas.itemconfigure(self.action_circle_id, fill=fill)
-        self.action_canvas.itemconfigure(self.action_text_id, text=text)
+        self._render_action_button()
 
     def _action_hover(self, is_hover: bool) -> None:
-        if (
-            not is_hover
-            or self.action_canvas is None
-            or self.action_circle_id is None
-            or self.is_busy
-        ):
-            self.refresh_action_button()
-            return
-
-        if self.is_connected():
-            fill = "#ea4659"
-        else:
-            fill = self.palette["accent_hover"]
-        self.action_canvas.itemconfigure(self.action_circle_id, fill=fill)
+        self.action_hovered = is_hover
+        self.refresh_action_button()
 
     def toggle_connection(self) -> None:
         if not self.strategies_map:
@@ -885,7 +954,7 @@ class ZapretGuiApp:
                 self.start_linux_from_bat(strategy_path)
                 self.process = None
                 self.current_runtime_mode = "linux-zapret"
-                self.set_status(f"Connected ({strategy_name} via Linux backend)")
+                self.set_status("Connected")
                 self.log(f"Connected with {strategy_name} via Linux backend.")
                 return
 
@@ -931,7 +1000,7 @@ class ZapretGuiApp:
                 preexec_fn=os.setsid,
             )
 
-            self.set_status(f"Connected ({strategy_name})")
+            self.set_status("Connected")
             self.log(f"Connected with {strategy_name}")
 
             threading.Thread(target=self.read_process_output, daemon=True).start()
