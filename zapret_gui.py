@@ -195,10 +195,8 @@ class ZapretGuiApp:
         self.refresh_strategies()
         self.ensure_user_lists()
         self.check_updates_async()
-        self.ensure_managed_service_async()
         self.refresh_autostart_state_async()
         self.ensure_desktop_entry()
-        self.request_admin_auth_async()
 
         self.root.protocol("WM_DELETE_WINDOW", self.on_close)
         self.setup_tray_icon()
@@ -479,13 +477,13 @@ class ZapretGuiApp:
         )
         style.configure(
             "TopIcon.TButton",
-            font=("Ubuntu", 15),
+            font=("Ubuntu", 18),
             foreground=self.palette["muted"],
             background=self.palette["bg"],
             borderwidth=0,
             focusthickness=0,
             relief="flat",
-            padding=(10, 4),
+            padding=(10, 5),
         )
         style.map(
             "TopIcon.TButton",
@@ -609,7 +607,7 @@ class ZapretGuiApp:
             text="⚙",
             style="TopIcon.TButton",
             command=self.open_settings_modal,
-            width=3,
+            width=4,
         )
         self.settings_button.pack(side="right")
 
@@ -1456,6 +1454,28 @@ class ZapretGuiApp:
             return ["sudo", *command]
         raise RuntimeError("Neither pkexec nor sudo is available for privileged Linux operations.")
 
+    def run_elevated_commands_batch(self, commands: list[list[str]], *, cwd: Path | None = None) -> str:
+        if not commands:
+            return ""
+        workdir = cwd or self.app_dir
+
+        if os.geteuid() == 0:
+            output: list[str] = []
+            for command in commands:
+                text = self.run_logged_command(command, cwd=workdir)
+                if text:
+                    output.append(text)
+            return "\n".join(output)
+
+        script = "set -e\n" + "\n".join(shlex.join(command) for command in commands)
+        if shutil.which("pkexec") is not None:
+            batch_cmd = ["pkexec", "/usr/bin/env", "bash", "-lc", script]
+            return self.run_logged_command(batch_cmd, cwd=workdir)
+        if shutil.which("sudo") is not None:
+            batch_cmd = ["sudo", "bash", "-lc", script]
+            return self.run_logged_command(batch_cmd, cwd=workdir)
+        raise RuntimeError("Neither pkexec nor sudo is available for privileged Linux operations.")
+
     def request_admin_auth_async(self) -> None:
         if not sys.platform.startswith("linux"):
             return
@@ -1783,7 +1803,12 @@ class ZapretGuiApp:
         )
         self.autostart_local_unit.write_text(unit_text, encoding="utf-8")
 
-    def install_or_update_managed_service(self, strategy: Strategy) -> None:
+    def install_or_update_managed_service(
+        self,
+        strategy: Strategy,
+        *,
+        post_commands: list[list[str]] | None = None,
+    ) -> None:
         if not sys.platform.startswith("linux"):
             raise RuntimeError("Managed service is supported only on Linux.")
         if strategy.kind != "bat":
@@ -1798,28 +1823,34 @@ class ZapretGuiApp:
         self.write_autostart_unit(config_path, strategy)
         self.autostart_strategy_file.write_text(f"{strategy.name}\n", encoding="utf-8")
 
-        install_cmd = self.elevate_command(
+        commands = [
             [
                 "install",
                 "-m",
                 "0644",
                 str(self.autostart_local_unit),
                 str(self.autostart_system_unit),
-            ]
-        )
-        reload_cmd = self.elevate_command(["systemctl", "daemon-reload"])
-
-        self.run_logged_command(install_cmd, cwd=self.app_dir)
-        self.run_logged_command(reload_cmd, cwd=self.app_dir)
+            ],
+            ["systemctl", "daemon-reload"],
+        ]
+        if post_commands:
+            commands.extend(post_commands)
+        self.run_elevated_commands_batch(commands, cwd=self.app_dir)
 
     def enable_autostart_service(self, strategy: Strategy) -> None:
         if not self.managed_service_exists():
-            self.install_or_update_managed_service(strategy)
+            self.install_or_update_managed_service(
+                strategy,
+                post_commands=[["systemctl", "enable", AUTOSTART_SERVICE_NAME]],
+            )
         elif self.read_autostart_strategy_name() != strategy.name:
-            self.install_or_update_managed_service(strategy)
-
-        enable_cmd = self.elevate_command(["systemctl", "enable", AUTOSTART_SERVICE_NAME])
-        self.run_logged_command(enable_cmd, cwd=self.app_dir)
+            self.install_or_update_managed_service(
+                strategy,
+                post_commands=[["systemctl", "enable", AUTOSTART_SERVICE_NAME]],
+            )
+        else:
+            enable_cmd = self.elevate_command(["systemctl", "enable", AUTOSTART_SERVICE_NAME])
+            self.run_logged_command(enable_cmd, cwd=self.app_dir)
 
     def disable_autostart_service(self) -> None:
         if not sys.platform.startswith("linux"):
@@ -1839,7 +1870,13 @@ class ZapretGuiApp:
     def start_managed_service(self, strategy: Strategy) -> None:
         service_strategy = self.read_autostart_strategy_name()
         if not self.managed_service_exists() or service_strategy != strategy.name:
-            self.install_or_update_managed_service(strategy)
+            self.set_status("Preparing...")
+            self.log("Managed service is missing or outdated. Initializing service...")
+            self.install_or_update_managed_service(
+                strategy,
+                post_commands=[["systemctl", "start", AUTOSTART_SERVICE_NAME]],
+            )
+            return
 
         start_cmd = self.elevate_command(["systemctl", "start", AUTOSTART_SERVICE_NAME])
         self.run_logged_command(start_cmd, cwd=self.app_dir)
