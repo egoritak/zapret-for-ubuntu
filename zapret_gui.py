@@ -156,8 +156,12 @@ class ZapretGuiApp:
         self.action_hovered = False
         self.strategy_combo: ttk.Combobox | None = None
         self.autostart_check: ttk.Checkbutton | None = None
+        self.settings_button: ttk.Button | None = None
         self.update_button: ttk.Button | None = None
         self.uninstall_button: ttk.Button | None = None
+        self.settings_backdrop: Toplevel | None = None
+        self.settings_window: Toplevel | None = None
+        self.uninstall_action_enabled = True
         self.autostart_busy = False
         self.autostart_update_in_progress = False
         self.autostart_enabled_cached = False
@@ -473,6 +477,33 @@ class ZapretGuiApp:
                 ("disabled", "#2a1a1f"),
             ],
         )
+        style.configure(
+            "TopIcon.TButton",
+            font=("Ubuntu", 15),
+            foreground=self.palette["muted"],
+            background=self.palette["bg"],
+            borderwidth=0,
+            focusthickness=0,
+            relief="flat",
+            padding=(10, 4),
+        )
+        style.map(
+            "TopIcon.TButton",
+            foreground=[("active", self.palette["accent_hover"])],
+            background=[("active", self.palette["bg"])],
+        )
+        style.configure(
+            "DialogTitle.TLabel",
+            background=self.palette["card"],
+            foreground=self.palette["text"],
+            font=("Ubuntu", 13, "bold"),
+        )
+        style.configure(
+            "DialogText.TLabel",
+            background=self.palette["card"],
+            foreground=self.palette["muted"],
+            font=("Ubuntu", 10),
+        )
 
         style.configure(
             "App.TCombobox",
@@ -571,8 +602,16 @@ class ZapretGuiApp:
         center = ttk.Frame(app, style="App.TFrame")
         center.pack(fill="both", expand=True)
 
-        top_spacer = ttk.Frame(center, style="App.TFrame")
-        top_spacer.pack(fill="x", pady=(8, 12))
+        top_bar = ttk.Frame(center, style="App.TFrame")
+        top_bar.pack(fill="x", pady=(8, 8))
+        self.settings_button = ttk.Button(
+            top_bar,
+            text="⚙",
+            style="TopIcon.TButton",
+            command=self.open_settings_modal,
+            width=3,
+        )
+        self.settings_button.pack(side="right")
 
         self.action_canvas = Canvas(
             center,
@@ -659,18 +698,7 @@ class ZapretGuiApp:
         self.open_update_button = ttk.Button(
             footer, text="Release Page", style="Ghost.TButton", command=self.open_release_page
         )
-        self.open_update_button.pack(side="right", padx=(8, 0))
-        self.logs_button = ttk.Button(
-            footer, text="Logs", style="Secondary.TButton", command=self.open_logs_window
-        )
-        self.logs_button.pack(side="right")
-        self.uninstall_button = ttk.Button(
-            footer,
-            text="Remove",
-            style="Danger.TButton",
-            command=self.request_uninstall,
-        )
-        self.uninstall_button.pack(side="right", padx=(8, 0))
+        self.open_update_button.pack(side="right")
 
         self.refresh_action_button()
 
@@ -956,6 +984,7 @@ class ZapretGuiApp:
             self.log("Uninstall is in progress. Exit is blocked until it finishes.")
             return
         self.is_exiting = True
+        self._close_settings_modal()
         if not sys.platform.startswith("linux"):
             self.disconnect()
         elif self.is_busy:
@@ -1066,6 +1095,104 @@ class ZapretGuiApp:
         except OSError:
             pass
 
+    def open_settings_modal(self) -> None:
+        if self.settings_window is not None and self.settings_window.winfo_exists():
+            self.settings_window.lift()
+            self.settings_window.focus_force()
+            return
+
+        self.root.update_idletasks()
+        root_x = self.root.winfo_rootx()
+        root_y = self.root.winfo_rooty()
+        root_w = max(320, self.root.winfo_width())
+        root_h = max(280, self.root.winfo_height())
+
+        backdrop = Toplevel(self.root)
+        backdrop.overrideredirect(True)
+        backdrop.transient(self.root)
+        backdrop.configure(bg="#05070e")
+        backdrop.geometry(f"{root_w}x{root_h}+{root_x}+{root_y}")
+        try:
+            backdrop.attributes("-alpha", 0.64)
+        except Exception:
+            pass
+        backdrop.lift()
+        backdrop.bind("<Button-1>", lambda _event: self._close_settings_modal())
+
+        dialog = Toplevel(self.root)
+        dialog.overrideredirect(True)
+        dialog.transient(self.root)
+        dialog.configure(bg=self.palette["bg"])
+        dialog_w = 336
+        dialog_h = 210
+        dialog_x = root_x + (root_w - dialog_w) // 2
+        dialog_y = root_y + (root_h - dialog_h) // 2
+        dialog.geometry(f"{dialog_w}x{dialog_h}+{dialog_x}+{dialog_y}")
+        dialog.lift()
+        dialog.bind("<Escape>", lambda _event: self._close_settings_modal())
+        dialog.protocol("WM_DELETE_WINDOW", self._close_settings_modal)
+        dialog.focus_force()
+        dialog.grab_set()
+
+        card = ttk.Frame(dialog, style="Card.TFrame", padding=(16, 14))
+        card.pack(fill="both", expand=True)
+
+        ttk.Label(card, text="Настройки", style="DialogTitle.TLabel").pack(anchor="center")
+        ttk.Label(
+            card,
+            text="Управление приложением и просмотр логов",
+            style="DialogText.TLabel",
+            justify="center",
+        ).pack(anchor="center", pady=(4, 12))
+
+        ttk.Button(
+            card,
+            text="Посмотреть логи",
+            style="Secondary.TButton",
+            command=self._settings_open_logs,
+        ).pack(fill="x")
+        self.uninstall_button = ttk.Button(
+            card,
+            text="Удалить приложение",
+            style="Danger.TButton",
+            command=self._settings_request_uninstall,
+        )
+        self.uninstall_button.pack(fill="x", pady=(8, 0))
+        ttk.Button(
+            card,
+            text="Закрыть",
+            style="Ghost.TButton",
+            command=self._close_settings_modal,
+        ).pack(anchor="center", pady=(12, 0))
+
+        self.settings_backdrop = backdrop
+        self.settings_window = dialog
+        self.set_uninstall_button_enabled(self.uninstall_action_enabled)
+
+    def _close_settings_modal(self) -> None:
+        dialog = self.settings_window
+        self.settings_window = None
+        self.uninstall_button = None
+        if dialog is not None and dialog.winfo_exists():
+            try:
+                dialog.grab_release()
+            except Exception:
+                pass
+            dialog.destroy()
+
+        backdrop = self.settings_backdrop
+        self.settings_backdrop = None
+        if backdrop is not None and backdrop.winfo_exists():
+            backdrop.destroy()
+
+    def _settings_open_logs(self) -> None:
+        self._close_settings_modal()
+        self.open_logs_window()
+
+    def _settings_request_uninstall(self) -> None:
+        self._close_settings_modal()
+        self.request_uninstall()
+
     def toggle_connection(self) -> None:
         if not self.strategies_map:
             self.log("No strategy available. Trying to recover from latest release...")
@@ -1158,6 +1285,8 @@ class ZapretGuiApp:
         self.root.after(0, _apply)
 
     def set_uninstall_button_enabled(self, enabled: bool) -> None:
+        self.uninstall_action_enabled = enabled
+
         def _apply() -> None:
             if self.uninstall_button is None or not self.uninstall_button.winfo_exists():
                 return
@@ -2863,6 +2992,8 @@ class ZapretGuiApp:
             return False
 
     def on_close(self) -> None:
+        if self.settings_window is not None and self.settings_window.winfo_exists():
+            self._close_settings_modal()
         if self.tray_available and not self.is_exiting:
             self.hide_window_to_tray()
             return

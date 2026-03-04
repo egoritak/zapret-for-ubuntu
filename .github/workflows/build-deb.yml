@@ -54,7 +54,7 @@ jobs:
             } else {
               const shortSha = context.sha.slice(0, 7);
               const url = `https://github.com/${owner}/${repo}/commit/${context.sha}`;
-              items = [`- Manual run for commit [${shortSha}](${url})`];
+              items = [`- Ручной запуск для коммита [${shortSha}](${url})`];
             }
 
             const body = [
