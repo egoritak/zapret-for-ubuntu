@@ -80,6 +80,7 @@ class ZapretGuiApp:
         self.linux_state_dir = self.linux_root / "state"
         self.linux_sync_stamp = self.linux_root / ".last_sync"
         self.linux_generated_config = self.linux_state_dir / "config.generated"
+        self.selected_strategy_file = self.linux_state_dir / "selected_strategy.txt"
         self.logs_dir = self.linux_root / "logs"
         self.log_file = self.logs_dir / "launcher.log"
 
@@ -98,6 +99,7 @@ class ZapretGuiApp:
         self.status_var = StringVar(value="Idle")
         self.local_version = self.read_local_version()
         self.version_badge_var = StringVar(value=f"v{self.local_version} · checking...")
+        self.last_selected_strategy_name = self.load_selected_strategy_name()
 
         self.logs_dir.mkdir(parents=True, exist_ok=True)
 
@@ -372,6 +374,7 @@ class ZapretGuiApp:
             justify="center",
         )
         self.strategy_combo.pack(fill="x")
+        self.strategy_combo.bind("<<ComboboxSelected>>", self.on_strategy_selected)
 
         footer = ttk.Frame(app, style="Card.TFrame", padding=(14, 12))
         footer.pack(fill="x", pady=(8, 0), padx=(0, 0), side="bottom")
@@ -698,13 +701,44 @@ class ZapretGuiApp:
             self.action_canvas.configure(state="normal")
         current = self.strategy_var.get()
         if current not in strategy_names:
-            self.strategy_var.set(strategy_names[0])
+            remembered = self.last_selected_strategy_name or ""
+            chosen = remembered if remembered in strategy_names else strategy_names[0]
+            self.strategy_var.set(chosen)
+            self.last_selected_strategy_name = chosen
+            self.save_selected_strategy_name(chosen)
+        else:
+            self.last_selected_strategy_name = current
+            self.save_selected_strategy_name(current)
 
         bat_count = sum(1 for item in found if item.kind == "bat")
         sh_count = sum(1 for item in found if item.kind == "sh")
         self.refresh_action_button()
         if not quiet:
             self.log(f"Loaded {len(found)} strategy file(s): .bat={bat_count}, .sh={sh_count}")
+
+    def on_strategy_selected(self, _event: object | None = None) -> None:
+        selected = self.strategy_var.get().strip()
+        if not selected:
+            return
+        self.last_selected_strategy_name = selected
+        self.save_selected_strategy_name(selected)
+
+    def load_selected_strategy_name(self) -> str:
+        try:
+            value = self.selected_strategy_file.read_text(encoding="utf-8").strip()
+            return value
+        except OSError:
+            return ""
+
+    def save_selected_strategy_name(self, name: str) -> None:
+        clean = name.strip()
+        if not clean:
+            return
+        try:
+            self.linux_state_dir.mkdir(parents=True, exist_ok=True)
+            self.selected_strategy_file.write_text(f"{clean}\n", encoding="utf-8")
+        except OSError:
+            return
 
     def ensure_user_lists(self) -> None:
         lists_dir = self.source_dir / "lists"

@@ -75,6 +75,11 @@ The backend repository is stored at:
   - `.linux-backend/logs/launcher.log`
 - use `Logs` button to open built-in log viewer.
 
+## UI state
+
+- selected alternative is remembered between launches in:
+  - `.linux-backend/state/selected_strategy.txt`
+
 ## Notes
 
 - If `zapret-discord/utils/check_updates.enabled` is missing, startup update check is skipped.
