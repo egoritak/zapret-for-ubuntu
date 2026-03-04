@@ -80,6 +80,18 @@ The backend repository is stored at:
 - selected alternative is remembered between launches in:
   - `.linux-backend/state/selected_strategy.txt`
 
+## Systemd Autostart
+
+- `Autostart` checkbox controls system service:
+  - `zapret-discord-autostart.service`
+- when enabled, launcher:
+  - generates config for currently selected `.bat` alternative
+  - installs/updates systemd unit in `/etc/systemd/system/`
+  - runs `systemctl enable --now zapret-discord-autostart.service`
+- when disabled, launcher runs:
+  - `systemctl disable --now zapret-discord-autostart.service`
+- checkbox state is synced from `systemctl is-enabled` on startup.
+
 ## Notes
 
 - If `zapret-discord/utils/check_updates.enabled` is missing, startup update check is skipped.

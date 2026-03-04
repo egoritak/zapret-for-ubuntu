@@ -18,7 +18,7 @@ import getpass
 import pwd
 from dataclasses import dataclass
 from pathlib import Path
-from tkinter import Canvas, StringVar, Tk, Toplevel
+from tkinter import Canvas, IntVar, StringVar, Tk, Toplevel
 from tkinter import ttk
 from tkinter.scrolledtext import ScrolledText
 
@@ -36,6 +36,7 @@ LEGACY_SOURCES_DIRNAMES = ("sources",)
 LEGACY_SOURCE_DIRS = ("bin", "lists", "utils", ".service")
 LEGACY_SOURCE_FILES = ("service.bat",)
 LEGACY_STRATEGY_PATTERNS = ("general*.bat", "general*.sh")
+AUTOSTART_SERVICE_NAME = "zapret-discord-autostart.service"
 
 
 def natural_sort_key(value: str) -> list[object]:
@@ -81,6 +82,9 @@ class ZapretGuiApp:
         self.linux_sync_stamp = self.linux_root / ".last_sync"
         self.linux_generated_config = self.linux_state_dir / "config.generated"
         self.selected_strategy_file = self.linux_state_dir / "selected_strategy.txt"
+        self.autostart_config_file = self.linux_state_dir / "config.autostart.generated"
+        self.autostart_local_unit = self.linux_state_dir / AUTOSTART_SERVICE_NAME
+        self.autostart_system_unit = Path("/etc/systemd/system") / AUTOSTART_SERVICE_NAME
         self.logs_dir = self.linux_root / "logs"
         self.log_file = self.logs_dir / "launcher.log"
 
@@ -94,8 +98,12 @@ class ZapretGuiApp:
         self.action_circle_id: int | None = None
         self.action_text_id: int | None = None
         self.action_hovered = False
+        self.autostart_check: ttk.Checkbutton | None = None
+        self.autostart_busy = False
+        self.autostart_update_in_progress = False
 
         self.strategy_var = StringVar()
+        self.autostart_var = IntVar(value=0)
         self.status_var = StringVar(value="Idle")
         self.local_version = self.read_local_version()
         self.version_badge_var = StringVar(value=f"v{self.local_version} · checking...")
@@ -108,6 +116,7 @@ class ZapretGuiApp:
         self.refresh_strategies()
         self.ensure_user_lists()
         self.check_updates_async()
+        self.refresh_autostart_state_async()
 
         self.root.protocol("WM_DELETE_WINDOW", self.on_close)
 
@@ -316,6 +325,26 @@ class ZapretGuiApp:
             fieldbackground=[("readonly", self.palette["card_alt"])],
             selectbackground=[("readonly", "#23314c")],
         )
+        style.configure(
+            "App.TCheckbutton",
+            background=self.palette["bg"],
+            foreground=self.palette["muted"],
+            font=("Ubuntu", 10),
+            relief="flat",
+            padding=(4, 2),
+        )
+        style.map(
+            "App.TCheckbutton",
+            foreground=[
+                ("selected", self.palette["text"]),
+                ("active", self.palette["text"]),
+                ("disabled", "#4f5c78"),
+            ],
+            background=[
+                ("selected", self.palette["bg"]),
+                ("active", self.palette["bg"]),
+            ],
+        )
 
     def _build_ui(self) -> None:
         app = ttk.Frame(self.root, style="App.TFrame", padding=(16, 14))
@@ -375,6 +404,17 @@ class ZapretGuiApp:
         )
         self.strategy_combo.pack(fill="x")
         self.strategy_combo.bind("<<ComboboxSelected>>", self.on_strategy_selected)
+
+        autostart_row = ttk.Frame(center, style="App.TFrame")
+        autostart_row.pack(fill="x", padx=(14, 14), pady=(0, 12))
+        self.autostart_check = ttk.Checkbutton(
+            autostart_row,
+            text="Autostart With Selected Alternative",
+            style="App.TCheckbutton",
+            variable=self.autostart_var,
+            command=self.on_autostart_toggled,
+        )
+        self.autostart_check.pack(anchor="center")
 
         footer = ttk.Frame(app, style="Card.TFrame", padding=(14, 12))
         footer.pack(fill="x", pady=(8, 0), padx=(0, 0), side="bottom")
@@ -668,6 +708,39 @@ class ZapretGuiApp:
             if self.active_command_proc is proc:
                 self.active_command_proc = None
 
+    def run_command_capture(
+        self,
+        command: list[str],
+        *,
+        cwd: Path | None = None,
+        env: dict[str, str] | None = None,
+    ) -> tuple[int, str]:
+        try:
+            proc = subprocess.run(
+                command,
+                cwd=cwd,
+                env=env,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                check=False,
+            )
+            output = (proc.stdout or "").strip()
+            return proc.returncode, output
+        except OSError as exc:
+            return 127, str(exc)
+
+    def elevate_command(self, command: list[str]) -> list[str]:
+        if os.geteuid() == 0:
+            return command
+        if shutil.which("pkexec") is not None:
+            return ["pkexec", *command]
+        if shutil.which("sudo") is not None:
+            return ["sudo", *command]
+        raise RuntimeError("Neither pkexec nor sudo is available for privileged Linux operations.")
+
     def refresh_strategies(self, quiet: bool = False) -> None:
         found: list[Strategy] = []
 
@@ -739,6 +812,161 @@ class ZapretGuiApp:
             self.selected_strategy_file.write_text(f"{clean}\n", encoding="utf-8")
         except OSError:
             return
+
+    def set_autostart_var_safely(self, enabled: bool) -> None:
+        def _apply() -> None:
+            self.autostart_update_in_progress = True
+            self.autostart_var.set(1 if enabled else 0)
+            self.autostart_update_in_progress = False
+
+        self.root.after(0, _apply)
+
+    def set_autostart_check_enabled(self, enabled: bool) -> None:
+        def _apply() -> None:
+            if self.autostart_check is None or not self.autostart_check.winfo_exists():
+                return
+            self.autostart_check.configure(state="normal" if enabled else "disabled")
+
+        self.root.after(0, _apply)
+
+    def refresh_autostart_state_async(self) -> None:
+        threading.Thread(target=self.refresh_autostart_state, daemon=True).start()
+
+    def refresh_autostart_state(self) -> None:
+        enabled = self.is_autostart_enabled()
+        self.set_autostart_var_safely(enabled)
+
+    def is_autostart_enabled(self) -> bool:
+        if not sys.platform.startswith("linux"):
+            return False
+        rc, output = self.run_command_capture(
+            ["systemctl", "is-enabled", AUTOSTART_SERVICE_NAME],
+            cwd=self.app_dir,
+        )
+        if rc != 0:
+            return False
+        return output.splitlines()[0].strip() == "enabled" if output else False
+
+    def on_autostart_toggled(self) -> None:
+        if self.autostart_update_in_progress:
+            return
+        if self.autostart_busy:
+            self.log("Autostart operation is already in progress.")
+            self.refresh_autostart_state_async()
+            return
+        if self.is_busy:
+            self.log("Cannot change autostart while another operation is in progress.")
+            self.refresh_autostart_state_async()
+            return
+
+        enabled = bool(self.autostart_var.get())
+        strategy_name = self.strategy_var.get().strip()
+        threading.Thread(
+            target=self._autostart_worker,
+            args=(enabled, strategy_name),
+            daemon=True,
+        ).start()
+
+    def _autostart_worker(self, enabled: bool, strategy_name: str) -> None:
+        self.autostart_busy = True
+        self.set_autostart_check_enabled(False)
+        try:
+            if enabled:
+                strategy = self.strategies_map.get(strategy_name)
+                if strategy is None:
+                    raise RuntimeError("Select a strategy before enabling autostart.")
+                self.enable_autostart_service(strategy)
+                self.log(f"Autostart enabled for {strategy.name}.")
+            else:
+                self.disable_autostart_service()
+                self.log("Autostart disabled.")
+        except Exception as exc:  # pylint: disable=broad-except
+            self.log(f"[ERROR] Failed to update autostart: {exc}")
+        finally:
+            self.autostart_busy = False
+            self.set_autostart_check_enabled(True)
+            self.refresh_autostart_state_async()
+
+    @staticmethod
+    def _systemd_escape(value: str) -> str:
+        return value.replace("\\", "\\\\").replace('"', '\\"')
+
+    def write_autostart_unit(self, config_path: Path, strategy: Strategy) -> None:
+        script = self.linux_repo_dir / "init.d" / "sysv" / "zapret"
+        if not script.exists():
+            raise RuntimeError(f"Linux service script not found: {script}")
+
+        self.linux_state_dir.mkdir(parents=True, exist_ok=True)
+        base = self._systemd_escape(str(self.linux_repo_dir))
+        rw = self._systemd_escape(str(self.linux_state_dir))
+        cfg = self._systemd_escape(str(config_path))
+        start = self._systemd_escape(str(script))
+        unit_text = (
+            "[Unit]\n"
+            f"Description=Zapret Discord Autostart ({strategy.name})\n"
+            "After=network-online.target\n"
+            "Wants=network-online.target\n"
+            "\n"
+            "[Service]\n"
+            "Type=oneshot\n"
+            "RemainAfterExit=yes\n"
+            f'Environment="ZAPRET_BASE={base}"\n'
+            f'Environment="ZAPRET_RW={rw}"\n'
+            f'Environment="ZAPRET_CONFIG={cfg}"\n'
+            f"ExecStart={start} restart\n"
+            f"ExecStop={start} stop\n"
+            "TimeoutStartSec=180\n"
+            "TimeoutStopSec=40\n"
+            "\n"
+            "[Install]\n"
+            "WantedBy=multi-user.target\n"
+        )
+        self.autostart_local_unit.write_text(unit_text, encoding="utf-8")
+
+    def enable_autostart_service(self, strategy: Strategy) -> None:
+        if not sys.platform.startswith("linux"):
+            raise RuntimeError("Autostart via systemd is supported only on Linux.")
+        if strategy.kind != "bat":
+            raise RuntimeError("Autostart is supported only for .bat alternatives on Linux backend.")
+        if " " in str(self.source_dir.resolve()):
+            raise RuntimeError("Project path contains spaces. Move project to a path without spaces.")
+
+        self.log("Preparing autostart service for selected alternative...")
+        self.ensure_linux_backend()
+        config_path = self.generate_linux_config_from_bat(strategy.path, output_path=self.autostart_config_file)
+        self.log(f"Generated autostart config: {config_path}")
+        self.write_autostart_unit(config_path, strategy)
+
+        install_cmd = self.elevate_command(
+            [
+                "install",
+                "-m",
+                "0644",
+                str(self.autostart_local_unit),
+                str(self.autostart_system_unit),
+            ]
+        )
+        reload_cmd = self.elevate_command(["systemctl", "daemon-reload"])
+        enable_cmd = self.elevate_command(["systemctl", "enable", "--now", AUTOSTART_SERVICE_NAME])
+
+        self.run_logged_command(install_cmd, cwd=self.app_dir)
+        self.run_logged_command(reload_cmd, cwd=self.app_dir)
+        self.run_logged_command(enable_cmd, cwd=self.app_dir)
+
+    def disable_autostart_service(self) -> None:
+        if not sys.platform.startswith("linux"):
+            return
+        disable_cmd = self.elevate_command(["systemctl", "disable", "--now", AUTOSTART_SERVICE_NAME])
+        rc, output = self.run_command_capture(disable_cmd, cwd=self.app_dir)
+        if output:
+            for line in output.splitlines():
+                if line.strip():
+                    self.log(line.strip())
+        if rc != 0:
+            lowered = output.lower()
+            benign = ("not loaded", "not-found", "does not exist", "no such file")
+            if not any(token in lowered for token in benign):
+                raise RuntimeError(f"systemctl disable failed with code {rc}.")
 
     def ensure_user_lists(self) -> None:
         lists_dir = self.source_dir / "lists"
@@ -954,13 +1182,19 @@ class ZapretGuiApp:
         current = getpass.getuser() or "root"
         return current
 
-    def generate_linux_config_from_bat(self, strategy_path: Path) -> Path:
+    def generate_linux_config_from_bat(
+        self,
+        strategy_path: Path,
+        *,
+        output_path: Path | None = None,
+    ) -> Path:
         runtime = Runtime(mode="native", prefix=[])
         game_filter = self.read_game_filter_values()
         args = self.extract_args(strategy_path, runtime, game_filter)
         tcp_ports, udp_ports, nfq_args = self.split_wf_ports_and_nfqws_args(args)
         nfqws_opt = self.build_nfqws_opt_block(nfq_args)
         ws_user = self.determine_ws_user()
+        target_path = output_path or self.linux_generated_config
 
         self.linux_state_dir.mkdir(parents=True, exist_ok=True)
         config_text = (
@@ -985,8 +1219,8 @@ class ZapretGuiApp:
             f"{nfqws_opt}\n"
             "\"\n"
         )
-        self.linux_generated_config.write_text(config_text, encoding="utf-8")
-        return self.linux_generated_config
+        target_path.write_text(config_text, encoding="utf-8")
+        return target_path
 
     def build_elevated_command(self, action: str) -> tuple[list[str], dict[str, str]]:
         script = self.linux_repo_dir / "init.d" / "sysv" / "zapret"
