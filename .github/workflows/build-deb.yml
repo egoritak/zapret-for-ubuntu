@@ -77,6 +77,32 @@ jobs:
               page += 1;
             }
 
+      - name: Remove old deb assets from deb-latest release
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const { owner, repo } = context.repo;
+            const tag = "deb-latest";
+            let release;
+            try {
+              const resp = await github.rest.repos.getReleaseByTag({ owner, repo, tag });
+              release = resp.data;
+            } catch (error) {
+              core.info("Release deb-latest not found yet. Skip cleanup.");
+              return;
+            }
+
+            const assetPattern = /^zapret-for-ubuntu_.*\.deb(\.sha256)?$/;
+            for (const asset of release.assets || []) {
+              if (!assetPattern.test(asset.name)) continue;
+              await github.rest.repos.deleteReleaseAsset({
+                owner,
+                repo,
+                asset_id: asset.id
+              });
+              core.info(`Deleted old release asset ${asset.name}`);
+            }
+
       - name: Publish/replace rolling release asset
         uses: softprops/action-gh-release@v2
         with:
