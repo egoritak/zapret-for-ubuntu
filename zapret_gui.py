@@ -11,11 +11,13 @@ import sys
 import threading
 import time
 import select
+import tempfile
 import urllib.error
 import urllib.request
 import webbrowser
 import getpass
 import pwd
+import zipfile
 from dataclasses import dataclass
 from pathlib import Path
 from tkinter import Canvas, IntVar, StringVar, Tk, Toplevel
@@ -110,7 +112,14 @@ class ZapretGuiApp:
         self.cancel_requested = False
         self.active_command_proc: subprocess.Popen[str] | None = None
         self.strategies_map: dict[str, Strategy] = {}
-        self.download_url = FALLBACK_DOWNLOAD_URL
+        self.release_page_url = FALLBACK_DOWNLOAD_URL
+        self.update_archive_url = ""
+        self.latest_version = ""
+        self.update_available = False
+        self.update_in_progress = False
+        self.update_spinner_frames = ["↻", "↺", "⟳", "⟲"]
+        self.update_spinner_index = 0
+        self.update_animation_job: str | None = None
         self.last_selected_strategy: Strategy | None = None
 
         self.linux_root = self.app_dir / ".linux-backend"
@@ -136,7 +145,9 @@ class ZapretGuiApp:
         self.action_circle_id: int | None = None
         self.action_text_id: int | None = None
         self.action_hovered = False
+        self.strategy_combo: ttk.Combobox | None = None
         self.autostart_check: ttk.Checkbutton | None = None
+        self.update_button: ttk.Button | None = None
         self.autostart_busy = False
         self.autostart_update_in_progress = False
         self.autostart_enabled_cached = False
@@ -534,7 +545,18 @@ class ZapretGuiApp:
         footer = ttk.Frame(app, style="Card.TFrame", padding=(14, 12))
         footer.pack(fill="x", pady=(8, 0), padx=(0, 0), side="bottom")
 
-        ttk.Label(footer, textvariable=self.version_badge_var, style="InfoValue.TLabel").pack(side="left")
+        version_box = ttk.Frame(footer, style="Card.TFrame")
+        version_box.pack(side="left")
+        ttk.Label(version_box, textvariable=self.version_badge_var, style="InfoValue.TLabel").pack(side="left")
+        self.update_button = ttk.Button(
+            version_box,
+            text="⟳",
+            style="Ghost.TButton",
+            command=self.start_update,
+            width=3,
+        )
+        self.update_button.pack(side="left", padx=(8, 0))
+        self.update_button.pack_forget()
         self.open_update_button = ttk.Button(
             footer, text="Release Page", style="Ghost.TButton", command=self.open_release_page
         )
@@ -584,6 +606,15 @@ class ZapretGuiApp:
         return f"#{r:02x}{g:02x}{b:02x}"
 
     def _action_theme(self) -> dict[str, str]:
+        if self.update_in_progress:
+            return {
+                "label": f"Updating {self._update_spinner_symbol()}",
+                "fill": "#1b1f2a",
+                "text": self.palette["accent_hover"],
+                "ring": self.palette["accent_hover"],
+                "glow": self.palette["accent"],
+                "cursor": "arrow",
+            }
         if not self.strategies_map:
             return {
                 "label": "No strategy",
@@ -748,6 +779,8 @@ class ZapretGuiApp:
             self.log(f"System tray initialization failed: {exc}")
 
     def _tray_toggle_label(self) -> str:
+        if self.update_in_progress:
+            return "Updating..."
         return "Disconnect" if (self.is_busy or self.is_connected()) else "Connect"
 
     def refresh_tray_menu_state(self) -> None:
@@ -809,6 +842,9 @@ class ZapretGuiApp:
 
     def exit_application(self) -> None:
         if self.is_exiting:
+            return
+        if self.update_in_progress:
+            self.log("Update is in progress. Exit is blocked until update finishes.")
             return
         self.is_exiting = True
         if not sys.platform.startswith("linux"):
@@ -907,6 +943,9 @@ class ZapretGuiApp:
         if not self.strategies_map:
             self.log("No strategy available.")
             return
+        if self.update_in_progress:
+            self.log("Update is in progress. Wait until it finishes.")
+            return
         if sys.platform.startswith("linux") and not self.is_busy:
             self.service_active_cached = self.is_service_active()
         if self.is_busy or self.is_connected():
@@ -973,6 +1012,77 @@ class ZapretGuiApp:
 
     def set_version_badge(self, value: str) -> None:
         self.root.after(0, self.version_badge_var.set, value)
+
+    def set_strategy_selector_enabled(self, enabled: bool) -> None:
+        def _apply() -> None:
+            if self.strategy_combo is None or not self.strategy_combo.winfo_exists():
+                return
+            self.strategy_combo.configure(state="readonly" if enabled else "disabled")
+
+        self.root.after(0, _apply)
+
+    def set_update_button_enabled(self, enabled: bool) -> None:
+        def _apply() -> None:
+            if self.update_button is None or not self.update_button.winfo_exists():
+                return
+            self.update_button.configure(state="normal" if enabled else "disabled")
+
+        self.root.after(0, _apply)
+
+    def _apply_update_button_visibility(self, visible: bool) -> None:
+        if self.update_button is None or not self.update_button.winfo_exists():
+            return
+        if visible:
+            if not self.update_button.winfo_manager():
+                self.update_button.pack(side="left", padx=(8, 0))
+        elif self.update_button.winfo_manager():
+            self.update_button.pack_forget()
+
+    def set_update_available_state(
+        self,
+        *,
+        available: bool,
+        latest_version: str = "",
+        archive_url: str = "",
+        release_page_url: str = "",
+    ) -> None:
+        def _apply() -> None:
+            self.update_available = available
+            self.latest_version = latest_version.strip()
+            self.update_archive_url = archive_url.strip()
+            if release_page_url:
+                self.release_page_url = release_page_url.strip()
+            self._apply_update_button_visibility(self.update_available and not self.update_in_progress)
+
+        self.root.after(0, _apply)
+
+    def _update_spinner_symbol(self) -> str:
+        if not self.update_spinner_frames:
+            return "*"
+        return self.update_spinner_frames[self.update_spinner_index % len(self.update_spinner_frames)]
+
+    def _run_update_animation_step(self) -> None:
+        if not self.update_in_progress:
+            self.update_animation_job = None
+            self.refresh_action_button()
+            return
+        if self.update_spinner_frames:
+            self.update_spinner_index = (self.update_spinner_index + 1) % len(self.update_spinner_frames)
+        self.refresh_action_button()
+        self.update_animation_job = self.root.after(180, self._run_update_animation_step)
+
+    def start_update_animation(self) -> None:
+        self.stop_update_animation()
+        self.update_spinner_index = 0
+        self.update_animation_job = self.root.after(180, self._run_update_animation_step)
+
+    def stop_update_animation(self) -> None:
+        if self.update_animation_job is not None:
+            try:
+                self.root.after_cancel(self.update_animation_job)
+            except Exception:
+                pass
+        self.update_animation_job = None
 
     def run_logged_command(
         self,
@@ -1298,6 +1408,10 @@ class ZapretGuiApp:
 
     def on_autostart_toggled(self) -> None:
         if self.autostart_update_in_progress:
+            return
+        if self.update_in_progress:
+            self.log("Cannot change autostart while update is in progress.")
+            self.refresh_autostart_state_async()
             return
         if self.autostart_busy:
             self.log("Autostart operation is already in progress.")
@@ -1771,6 +1885,9 @@ class ZapretGuiApp:
         self.run_logged_command(command, cwd=self.app_dir, env=env)
 
     def connect(self) -> None:
+        if self.update_in_progress:
+            self.log("Update is in progress. Connect is temporarily disabled.")
+            return
         if sys.platform.startswith("linux"):
             if self.is_busy:
                 if self.busy_operation == "service-stop":
@@ -1960,6 +2077,9 @@ class ZapretGuiApp:
         self.root.after(0, on_exit)
 
     def disconnect(self) -> None:
+        if self.update_in_progress:
+            self.log("Update is in progress. Disconnect is temporarily disabled.")
+            return
         if sys.platform.startswith("linux"):
             if self.is_busy:
                 if self.busy_operation == "service-start":
@@ -2091,15 +2211,224 @@ class ZapretGuiApp:
     def check_updates_async(self) -> None:
         threading.Thread(target=self.check_updates, daemon=True).start()
 
+    @staticmethod
+    def build_release_archive_url(version: str) -> str:
+        clean = version.strip()
+        if not clean:
+            return ""
+        return (
+            "https://github.com/Flowseal/zapret-discord-youtube/releases/download/"
+            f"{clean}/zapret-discord-youtube-{clean}.zip"
+        )
+
+    @staticmethod
+    def _source_score(path: Path) -> int:
+        score = 0
+        if (path / "service.bat").is_file():
+            score += 8
+        if (path / "bin").is_dir():
+            score += 4
+        if (path / "lists").is_dir():
+            score += 4
+        if any(path.glob("general*.bat")):
+            score += 2
+        if any(path.glob("general*.sh")):
+            score += 1
+        return score
+
+    @staticmethod
+    def _is_within_dir(path: Path, root: Path) -> bool:
+        try:
+            path.resolve().relative_to(root.resolve())
+            return True
+        except ValueError:
+            return False
+
+    def _download_update_archive(self, url: str, target: Path) -> None:
+        req = urllib.request.Request(
+            url,
+            headers={
+                "User-Agent": "zapret-ubuntu-gui/1.0",
+                "Cache-Control": "no-cache",
+            },
+        )
+        with urllib.request.urlopen(req, timeout=45) as response, target.open("wb") as handle:
+            shutil.copyfileobj(response, handle)
+
+    def _extract_update_archive(self, archive_path: Path, extract_dir: Path) -> None:
+        extract_root = extract_dir.resolve()
+        with zipfile.ZipFile(archive_path, "r") as zip_file:
+            for member in zip_file.infolist():
+                member_target = (extract_dir / member.filename).resolve()
+                if member_target != extract_root and extract_root not in member_target.parents:
+                    raise RuntimeError("Update archive contains invalid paths.")
+            zip_file.extractall(extract_dir)
+
+    def _find_extracted_source_dir(self, extract_dir: Path) -> Path:
+        best_path: Path | None = None
+        best_score = -1
+        for path in [extract_dir, *extract_dir.rglob("*")]:
+            if not path.is_dir():
+                continue
+            score = self._source_score(path)
+            if score > best_score:
+                best_path = path
+                best_score = score
+        if best_path is None or best_score <= 0:
+            raise RuntimeError("Cannot find zapret-discord payload inside downloaded archive.")
+        return best_path
+
+    def _backup_user_overrides(self) -> dict[Path, bytes]:
+        overrides = (
+            Path("lists/ipset-exclude-user.txt"),
+            Path("lists/list-exclude-user.txt"),
+            Path("lists/list-general-user.txt"),
+            Path("utils/check_updates.enabled"),
+            Path("utils/game_filter.enabled"),
+        )
+        backup: dict[Path, bytes] = {}
+        for relative in overrides:
+            target = self.source_dir / relative
+            if target.is_file():
+                backup[relative] = target.read_bytes()
+        return backup
+
+    def _restore_user_overrides(self, backup: dict[Path, bytes]) -> None:
+        for relative, data in backup.items():
+            target = self.source_dir / relative
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(data)
+
+    def _replace_source_tree(self, source_payload_dir: Path) -> None:
+        source_root = self.source_dir.resolve()
+        if source_root == self.app_dir.resolve():
+            raise RuntimeError("Refusing to replace source tree: source directory points to application root.")
+        if not self._is_within_dir(source_root, self.app_dir):
+            raise RuntimeError("Refusing to replace source tree outside application directory.")
+        if not source_payload_dir.is_dir():
+            raise RuntimeError(f"Invalid extracted source directory: {source_payload_dir}")
+
+        user_backup = self._backup_user_overrides()
+        self.source_dir.mkdir(parents=True, exist_ok=True)
+
+        for item in self.source_dir.iterdir():
+            if item.is_dir() and not item.is_symlink():
+                shutil.rmtree(item)
+            else:
+                item.unlink(missing_ok=True)
+
+        for item in source_payload_dir.iterdir():
+            destination = self.source_dir / item.name
+            if item.is_dir() and not item.is_symlink():
+                shutil.copytree(item, destination)
+            else:
+                shutil.copy2(item, destination)
+
+        self._restore_user_overrides(user_backup)
+
+    def _update_worker(self, archive_url: str, target_version: str) -> None:
+        work_dir: Path | None = None
+        try:
+            if sys.platform.startswith("linux"):
+                self.log("Stopping current service before update...")
+                self.stop_managed_service()
+                self.log("Service stopped. Starting update...")
+            else:
+                self.log("Starting update...")
+
+            self.linux_root.mkdir(parents=True, exist_ok=True)
+            work_dir = Path(tempfile.mkdtemp(prefix="update-", dir=str(self.linux_root)))
+            archive_path = work_dir / "release.zip"
+            extract_dir = work_dir / "extract"
+            extract_dir.mkdir(parents=True, exist_ok=True)
+
+            self.log(f"Downloading update archive: {archive_url}")
+            self._download_update_archive(archive_url, archive_path)
+            self.log(f"Downloaded archive to: {archive_path}")
+
+            self.log("Extracting archive...")
+            self._extract_update_archive(archive_path, extract_dir)
+            payload_dir = self._find_extracted_source_dir(extract_dir)
+            self.log(f"Found source payload in: {payload_dir}")
+
+            self.log(f"Replacing source directory: {self.source_dir}")
+            self._replace_source_tree(payload_dir)
+
+            self.local_version = self.read_local_version()
+            self.log(f"Update complete: now at version {self.local_version} (target {target_version}).")
+            self.set_status("Idle")
+        except Exception as exc:  # pylint: disable=broad-except
+            self.set_status("Error")
+            self.log(f"[ERROR] Update failed: {exc}")
+        finally:
+            if work_dir is not None:
+                try:
+                    shutil.rmtree(work_dir)
+                except OSError:
+                    pass
+
+            def _finish() -> None:
+                self.update_in_progress = False
+                self.is_busy = False
+                self.busy_operation = None
+                self.cancel_requested = False
+                self.stop_update_animation()
+                self.set_strategy_selector_enabled(True)
+                self.set_autostart_check_enabled(True)
+                self.set_update_button_enabled(True)
+                self._apply_update_button_visibility(self.update_available)
+                self.refresh_strategies(quiet=True)
+                self.refresh_autostart_state_async()
+                self.check_updates_async()
+                self.refresh_action_button()
+
+            self.root.after(0, _finish)
+
+    def start_update(self) -> None:
+        if self.update_in_progress:
+            self.log("Update is already in progress.")
+            return
+        if self.is_busy:
+            self.log("Cannot start update while another operation is in progress.")
+            return
+        if not self.update_available:
+            self.log("Current version is already up to date.")
+            return
+        archive_url = self.update_archive_url.strip()
+        if not archive_url:
+            self.log("Update archive URL is not available.")
+            return
+
+        self.update_in_progress = True
+        self.update_available = False
+        self.is_busy = True
+        self.busy_operation = "update"
+        self.cancel_requested = False
+        self.set_status("Updating...")
+        self.set_strategy_selector_enabled(False)
+        self.set_autostart_check_enabled(False)
+        self.set_update_button_enabled(False)
+        self._apply_update_button_visibility(False)
+        self.start_update_animation()
+        self.refresh_action_button()
+        self.log(f"Starting update to {self.latest_version or 'new version'}...")
+        threading.Thread(
+            target=self._update_worker,
+            args=(archive_url, self.latest_version),
+            daemon=True,
+        ).start()
+
     def check_updates(self) -> None:
         flag = self.source_dir / "utils" / "check_updates.enabled"
         if not flag.exists():
             self.set_version_badge(f"v{self.local_version} · auto-check off")
+            self.set_update_available_state(available=False, release_page_url=FALLBACK_DOWNLOAD_URL)
             return
 
         version_url, release_url, download_url = self.parse_update_sources()
-        self.download_url = download_url
+        self.release_page_url = download_url
         local_version = self.read_local_version()
+        self.local_version = local_version
 
         req = urllib.request.Request(
             version_url,
@@ -2113,27 +2442,44 @@ class ZapretGuiApp:
                 latest_version = response.read().decode("utf-8", errors="replace").strip()
         except (urllib.error.URLError, TimeoutError, OSError) as exc:
             self.set_version_badge(f"v{local_version} · check failed")
+            self.set_update_available_state(available=False, release_page_url=download_url)
             self.log(f"Update check failed: {exc}")
             return
 
         if not latest_version:
             self.set_version_badge(f"v{local_version} · check failed")
+            self.set_update_available_state(available=False, release_page_url=download_url)
             return
+
+        release_page = f"{release_url}{latest_version}" if release_url else download_url
 
         if latest_version == local_version:
             self.set_version_badge(f"v{local_version} \u2713")
+            self.set_update_available_state(
+                available=False,
+                latest_version=latest_version,
+                archive_url="",
+                release_page_url=release_page,
+            )
             return
 
-        self.download_url = f"{release_url}{latest_version}" if release_url else download_url
+        archive_url = self.build_release_archive_url(latest_version)
+        self.set_update_available_state(
+            available=True,
+            latest_version=latest_version,
+            archive_url=archive_url,
+            release_page_url=release_page,
+        )
         self.set_version_badge(f"v{local_version} \u2192 v{latest_version}")
         self.log(f"New version available: {latest_version}")
-        self.log(f"Release page: {self.download_url}")
+        self.log(f"Release page: {release_page}")
+        self.log(f"Update archive: {archive_url}")
 
     def open_release_page(self) -> None:
-        if not self.download_url:
+        if not self.release_page_url:
             self.log("Release URL is not available.")
             return
-        url = self.download_url
+        url = self.release_page_url
         opened = False
 
         if os.geteuid() == 0:

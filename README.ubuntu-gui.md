@@ -26,6 +26,8 @@ To update source files, replace contents of `zapret-discord/` only.
 - on startup, launcher ensures managed systemd service exists (creates/updates it when missing);
 - `Connect/Disconnect` controls managed systemd service state (`start`/`stop`);
 - `Autostart` checkbox controls service boot autostart (`enable`/`disable`);
+- when a newer version is detected, update button (`⟳`) appears near version badge;
+- update button downloads release zip and replaces `zapret-discord/` automatically;
 - on first `.bat` service preparation, launcher clones/updates official Linux backend (`bol-van/zapret`) and builds binaries.
 - main window is minimal: one large `Connect/Disconnect` action button + strategy dropdown + footer controls.
 - app can stay in system tray with `Show Zapret`, `Connect/Disconnect`, `Exit`.
@@ -83,6 +85,23 @@ The backend repository is stored at:
 - launcher writes logs to:
   - `.linux-backend/logs/launcher.log`
 - use `Logs` button to open built-in log viewer.
+
+## Update Button
+
+- update button appears only when local version is outdated;
+- archive URL pattern:
+  - `https://github.com/Flowseal/zapret-discord-youtube/releases/download/{VERSION}/zapret-discord-youtube-{VERSION}.zip`
+- during update:
+  - active service is stopped;
+  - `Connect/Disconnect` action is blocked;
+  - main circle button shows `Updating` with spinner;
+  - source files in `zapret-discord/` are replaced from downloaded archive;
+  - user override files are preserved:
+    - `lists/ipset-exclude-user.txt`
+    - `lists/list-exclude-user.txt`
+    - `lists/list-general-user.txt`
+    - `utils/check_updates.enabled`
+    - `utils/game_filter.enabled`
 
 ## UI state
 
