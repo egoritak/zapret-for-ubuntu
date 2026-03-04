@@ -1,6 +1,19 @@
 # Ubuntu GUI launcher
 
 `zapret_gui.py` is a GUI launcher for Ubuntu with strategy selection and `Connect`/`Disconnect`.
+Launcher logic and zapret-discord sources are now separated.
+
+## Directory layout
+
+- launcher/app files:
+  - `zapret_gui.py`
+  - `run-ubuntu-gui.sh`
+  - `.linux-backend/`
+- replaceable zapret-discord sources:
+  - `zapret-discord/`
+  - (`bin/`, `lists/`, `utils/`, `.service/`, `service.bat`, `general*.bat`, `general*.sh`)
+
+To update source files, replace contents of `zapret-discord/` only.
 
 ## What it does
 
@@ -11,6 +24,7 @@
 - on Linux, `.bat` strategies are automatically converted to Linux `nfqws` config and run **without Wine**;
 - on first `.bat` launch, automatically clones/updates official Linux backend (`bol-van/zapret`) and builds binaries.
 - main window is minimal: one large `Connect/Disconnect` action button + strategy dropdown + footer controls.
+- if old flat layout is detected, launcher auto-migrates known source files into `zapret-discord/`.
 
 ## Run
 
@@ -63,6 +77,6 @@ The backend repository is stored at:
 
 ## Notes
 
-- If `utils/check_updates.enabled` is missing, startup update check is skipped.
+- If `zapret-discord/utils/check_updates.enabled` is missing, startup update check is skipped.
 - Strategy and update sources are read dynamically each start, so replacing project files with newer versions is supported.
 - Keep project path without spaces for robust shell option parsing.

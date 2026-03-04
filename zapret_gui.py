@@ -31,6 +31,11 @@ FALLBACK_RELEASE_URL = "https://github.com/Flowseal/zapret-discord-youtube/relea
 FALLBACK_DOWNLOAD_URL = "https://github.com/Flowseal/zapret-discord-youtube/releases/latest"
 LINUX_UPSTREAM_REPO = "https://github.com/bol-van/zapret.git"
 LINUX_SYNC_INTERVAL_SEC = 12 * 3600
+SOURCES_DIRNAME = "zapret-discord"
+LEGACY_SOURCES_DIRNAMES = ("sources",)
+LEGACY_SOURCE_DIRS = ("bin", "lists", "utils", ".service")
+LEGACY_SOURCE_FILES = ("service.bat",)
+LEGACY_STRATEGY_PATTERNS = ("general*.bat", "general*.sh")
 
 
 def natural_sort_key(value: str) -> list[object]:
@@ -55,9 +60,11 @@ class OperationCancelled(Exception):
 
 
 class ZapretGuiApp:
-    def __init__(self, root: Tk, base_dir: Path) -> None:
+    def __init__(self, root: Tk, app_dir: Path) -> None:
         self.root = root
-        self.base_dir = base_dir
+        self.app_dir = app_dir
+        self.sources_root = self._prepare_sources_root()
+        self.source_dir = self._prepare_source_dir()
         self.process: subprocess.Popen[str] | None = None
         self.current_runtime_mode: str | None = None
         self.is_busy = False
@@ -68,7 +75,7 @@ class ZapretGuiApp:
         self.download_url = FALLBACK_DOWNLOAD_URL
         self.last_selected_strategy: Strategy | None = None
 
-        self.linux_root = self.base_dir / ".linux-backend"
+        self.linux_root = self.app_dir / ".linux-backend"
         self.linux_repo_dir = self.linux_root / "zapret"
         self.linux_state_dir = self.linux_root / "state"
         self.linux_sync_stamp = self.linux_root / ".last_sync"
@@ -101,6 +108,101 @@ class ZapretGuiApp:
         self.check_updates_async()
 
         self.root.protocol("WM_DELETE_WINDOW", self.on_close)
+
+    def _prepare_sources_root(self) -> Path:
+        primary = self.app_dir / SOURCES_DIRNAME
+        if not primary.exists():
+            for legacy_name in LEGACY_SOURCES_DIRNAMES:
+                legacy = self.app_dir / legacy_name
+                if not legacy.exists():
+                    continue
+                try:
+                    shutil.move(str(legacy), str(primary))
+                    break
+                except Exception:
+                    # If move failed, keep fallback logic in _prepare_source_dir.
+                    break
+        primary.mkdir(parents=True, exist_ok=True)
+        return primary
+
+    def _path_has_source_markers(self, path: Path) -> bool:
+        if not path.exists() or not path.is_dir():
+            return False
+        if (path / "bin").is_dir():
+            return True
+        if (path / "lists").is_dir():
+            return True
+        if (path / "service.bat").is_file():
+            return True
+        if any(path.glob("general*.bat")):
+            return True
+        if any(path.glob("general*.sh")):
+            return True
+        return False
+
+    def _discover_source_dir_in(self, root: Path) -> Path:
+        candidates = [entry for entry in root.iterdir() if entry.is_dir()]
+        candidates = sorted(candidates, key=lambda item: natural_sort_key(item.name), reverse=True)
+        for candidate in candidates:
+            if self._path_has_source_markers(candidate):
+                return candidate
+        if self._path_has_source_markers(root):
+            return root
+        return root
+
+    def _discover_source_dir(self) -> Path:
+        return self._discover_source_dir_in(self.sources_root)
+
+    def _migrate_legacy_sources(self) -> bool:
+        moved_any = False
+        self.sources_root.mkdir(parents=True, exist_ok=True)
+
+        for name in LEGACY_SOURCE_DIRS:
+            src = self.app_dir / name
+            dst = self.sources_root / name
+            if not src.exists() or dst.exists():
+                continue
+            shutil.move(str(src), str(dst))
+            moved_any = True
+
+        for name in LEGACY_SOURCE_FILES:
+            src = self.app_dir / name
+            dst = self.sources_root / name
+            if not src.exists() or dst.exists():
+                continue
+            shutil.move(str(src), str(dst))
+            moved_any = True
+
+        for pattern in LEGACY_STRATEGY_PATTERNS:
+            for src in self.app_dir.glob(pattern):
+                if not src.is_file():
+                    continue
+                dst = self.sources_root / src.name
+                if dst.exists():
+                    continue
+                shutil.move(str(src), str(dst))
+                moved_any = True
+
+        return moved_any
+
+    def _prepare_source_dir(self) -> Path:
+        self.sources_root.mkdir(parents=True, exist_ok=True)
+        discovered = self._discover_source_dir()
+        if discovered != self.sources_root or self._path_has_source_markers(discovered):
+            return discovered
+
+        for legacy_name in LEGACY_SOURCES_DIRNAMES:
+            legacy_root = self.app_dir / legacy_name
+            if legacy_root.exists() and legacy_root.is_dir():
+                legacy_discovered = self._discover_source_dir_in(legacy_root)
+                if legacy_discovered != legacy_root or self._path_has_source_markers(legacy_discovered):
+                    return legacy_discovered
+
+        if self._path_has_source_markers(self.app_dir):
+            self._migrate_legacy_sources()
+            return self._discover_source_dir()
+
+        return self.sources_root
 
     def _setup_style(self) -> None:
         self.root.title("Zapret")
@@ -566,16 +668,16 @@ class ZapretGuiApp:
     def refresh_strategies(self, quiet: bool = False) -> None:
         found: list[Strategy] = []
 
-        bat_files = [p for p in self.base_dir.glob("general (ALT*).bat") if p.is_file()]
+        bat_files = [p for p in self.source_dir.glob("general (ALT*).bat") if p.is_file()]
         if not bat_files:
             bat_files = [
                 p
-                for p in self.base_dir.glob("general*.bat")
+                for p in self.source_dir.glob("general*.bat")
                 if p.is_file() and p.name.lower() != "service.bat"
             ]
         found.extend(Strategy(name=p.name, path=p, kind="bat") for p in bat_files)
 
-        sh_files = [p for p in self.base_dir.glob("general*.sh") if p.is_file()]
+        sh_files = [p for p in self.source_dir.glob("general*.sh") if p.is_file()]
         found.extend(Strategy(name=p.name, path=p, kind="sh") for p in sh_files)
 
         found = sorted(found, key=lambda item: natural_sort_key(item.name))
@@ -605,7 +707,7 @@ class ZapretGuiApp:
             self.log(f"Loaded {len(found)} strategy file(s): .bat={bat_count}, .sh={sh_count}")
 
     def ensure_user_lists(self) -> None:
-        lists_dir = self.base_dir / "lists"
+        lists_dir = self.source_dir / "lists"
         lists_dir.mkdir(parents=True, exist_ok=True)
 
         defaults = {
@@ -620,7 +722,7 @@ class ZapretGuiApp:
 
     def read_game_filter_values(self) -> dict[str, str]:
         default = {"GameFilter": "12", "GameFilterTCP": "12", "GameFilterUDP": "12"}
-        game_flag = self.base_dir / "utils" / "game_filter.enabled"
+        game_flag = self.source_dir / "utils" / "game_filter.enabled"
         if not game_flag.exists():
             return default
 
@@ -638,11 +740,11 @@ class ZapretGuiApp:
         return {"GameFilter": "1024-65535", "GameFilterTCP": "12", "GameFilterUDP": "1024-65535"}
 
     def resolve_runtime(self) -> Runtime:
-        native_winws = self.base_dir / "bin" / "winws"
+        native_winws = self.source_dir / "bin" / "winws"
         if native_winws.exists() and os.access(native_winws, os.X_OK):
             return Runtime(mode="native", prefix=[str(native_winws)])
 
-        winws_exe = self.base_dir / "bin" / "winws.exe"
+        winws_exe = self.source_dir / "bin" / "winws.exe"
         if winws_exe.exists():
             wine = shutil.which("wine")
             if wine is None:
@@ -693,8 +795,8 @@ class ZapretGuiApp:
 
         args_line = " ".join(fragments)
         replacements = {
-            "%BIN%": self.to_runtime_path(runtime, self.base_dir / "bin", with_trailing_sep=True),
-            "%LISTS%": self.to_runtime_path(runtime, self.base_dir / "lists", with_trailing_sep=True),
+            "%BIN%": self.to_runtime_path(runtime, self.source_dir / "bin", with_trailing_sep=True),
+            "%LISTS%": self.to_runtime_path(runtime, self.source_dir / "lists", with_trailing_sep=True),
             "%GameFilter%": game_filter["GameFilter"],
             "%GameFilterTCP%": game_filter["GameFilterTCP"],
             "%GameFilterUDP%": game_filter["GameFilterUDP"],
@@ -731,7 +833,7 @@ class ZapretGuiApp:
                 self.log("Syncing Linux zapret backend from upstream...")
                 self.run_logged_command(
                     ["git", "-C", str(self.linux_repo_dir), "pull", "--ff-only"],
-                    cwd=self.base_dir,
+                    cwd=self.app_dir,
                 )
                 self.mark_linux_synced()
                 need_build = True
@@ -741,7 +843,7 @@ class ZapretGuiApp:
             self.log("Cloning Linux zapret backend (first run)...")
             self.run_logged_command(
                 ["git", "clone", "--depth=1", LINUX_UPSTREAM_REPO, str(self.linux_repo_dir)],
-                cwd=self.base_dir,
+                cwd=self.app_dir,
             )
             self.mark_linux_synced()
             need_build = True
@@ -751,7 +853,7 @@ class ZapretGuiApp:
             self.log("Building Linux binaries (nfqws/tpws/ip2net/mdig)...")
             self.run_logged_command(
                 ["make", "-C", str(self.linux_repo_dir), f"-j{jobs}"],
-                cwd=self.base_dir,
+                cwd=self.app_dir,
             )
 
         if not (nfqws_bin.exists() and os.access(nfqws_bin, os.X_OK)):
@@ -795,7 +897,7 @@ class ZapretGuiApp:
 
     def determine_ws_user(self) -> str:
         try:
-            owner_uid = self.base_dir.stat().st_uid
+            owner_uid = self.source_dir.stat().st_uid
             if owner_uid != 0:
                 return pwd.getpwuid(owner_uid).pw_name
         except Exception:
@@ -893,7 +995,7 @@ class ZapretGuiApp:
         raise RuntimeError("Neither pkexec nor sudo is available for privileged Linux operations.")
 
     def start_linux_from_bat(self, strategy_path: Path) -> None:
-        if " " in str(self.base_dir.resolve()):
+        if " " in str(self.source_dir.resolve()):
             raise RuntimeError("Project path contains spaces. Move project to a path without spaces.")
 
         self.log("Preparing Linux backend for .bat strategy...")
@@ -908,7 +1010,7 @@ class ZapretGuiApp:
         self.log(f"Using WS_USER={ws_user}")
         command, env = self.build_elevated_command("restart")
         self.log("Starting Linux zapret service (root privileges required)...")
-        self.run_logged_command(command, cwd=self.base_dir, env=env)
+        self.run_logged_command(command, cwd=self.app_dir, env=env)
 
     def stop_linux_backend(self) -> None:
         if not self.linux_generated_config.exists():
@@ -916,7 +1018,7 @@ class ZapretGuiApp:
             return
         command, env = self.build_elevated_command("stop")
         self.log("Stopping Linux zapret service...")
-        self.run_logged_command(command, cwd=self.base_dir, env=env)
+        self.run_logged_command(command, cwd=self.app_dir, env=env)
 
     def connect(self) -> None:
         if self.is_busy:
@@ -989,7 +1091,7 @@ class ZapretGuiApp:
 
             self.process = subprocess.Popen(
                 command,
-                cwd=self.base_dir,
+                cwd=self.source_dir,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
                 text=True,
@@ -1105,7 +1207,7 @@ class ZapretGuiApp:
         release_url = FALLBACK_RELEASE_URL
         download_url = FALLBACK_DOWNLOAD_URL
 
-        service_bat = self.base_dir / "service.bat"
+        service_bat = self.source_dir / "service.bat"
         if not service_bat.exists():
             return version_url, release_url, download_url
 
@@ -1128,13 +1230,13 @@ class ZapretGuiApp:
         return values["GITHUB_VERSION_URL"], values["GITHUB_RELEASE_URL"], values["GITHUB_DOWNLOAD_URL"]
 
     def read_local_version(self) -> str:
-        local_file = self.base_dir / ".service" / "version.txt"
+        local_file = self.source_dir / ".service" / "version.txt"
         if local_file.exists():
             value = local_file.read_text(encoding="utf-8", errors="ignore").strip()
             if value:
                 return value
 
-        service_bat = self.base_dir / "service.bat"
+        service_bat = self.source_dir / "service.bat"
         if service_bat.exists():
             text = service_bat.read_text(encoding="utf-8", errors="ignore")
             match = re.search(r'set\s+"LOCAL_VERSION=([^"]+)"', text, flags=re.IGNORECASE)
@@ -1147,7 +1249,7 @@ class ZapretGuiApp:
         threading.Thread(target=self.check_updates, daemon=True).start()
 
     def check_updates(self) -> None:
-        flag = self.base_dir / "utils" / "check_updates.enabled"
+        flag = self.source_dir / "utils" / "check_updates.enabled"
         if not flag.exists():
             self.set_version_badge(f"v{self.local_version} · auto-check off")
             return
@@ -1242,7 +1344,7 @@ class ZapretGuiApp:
         try:
             subprocess.Popen(
                 command,
-                cwd=self.base_dir,
+                cwd=self.app_dir,
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
                 start_new_session=True,
@@ -1258,7 +1360,8 @@ class ZapretGuiApp:
 
 def main() -> None:
     root = Tk()
-    app = ZapretGuiApp(root=root, base_dir=Path(__file__).resolve().parent)
+    app = ZapretGuiApp(root=root, app_dir=Path(__file__).resolve().parent)
+    app.log(f"Source directory: {app.source_dir}")
     app.log(f"Launcher started. Log file: {app.log_file}")
     root.mainloop()
 
