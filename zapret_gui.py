@@ -20,24 +20,39 @@ import pwd
 import zipfile
 from dataclasses import dataclass
 from pathlib import Path
-from tkinter import Canvas, IntVar, StringVar, Tk, Toplevel
+from tkinter import Canvas, IntVar, PhotoImage, StringVar, Tk, Toplevel
 from tkinter import ttk
 from tkinter import messagebox
 from tkinter.scrolledtext import ScrolledText
 
 try:
-    from PIL import Image, ImageTk
+    import fcntl
 
-    PIL_AVAILABLE = True
+    POSIX_FLOCK_AVAILABLE = True
+except Exception:
+    fcntl = None  # type: ignore[assignment]
+    POSIX_FLOCK_AVAILABLE = False
+
+try:
+    from PIL import Image
+
+    PIL_IMAGE_AVAILABLE = True
     if hasattr(Image, "Resampling"):
         RESAMPLE_LANCZOS = Image.Resampling.LANCZOS
     else:
         RESAMPLE_LANCZOS = Image.LANCZOS
 except Exception:
     Image = None
-    ImageTk = None
-    PIL_AVAILABLE = False
+    PIL_IMAGE_AVAILABLE = False
     RESAMPLE_LANCZOS = None
+
+try:
+    from PIL import ImageTk
+
+    PIL_IMAGETK_AVAILABLE = True
+except Exception:
+    ImageTk = None
+    PIL_IMAGETK_AVAILABLE = False
 
 try:
     import gi
@@ -51,11 +66,28 @@ try:
         from gi.repository import GdkPixbuf
     except Exception:
         GdkPixbuf = None
+    APP_INDICATOR_AVAILABLE = False
+    AppIndicator3 = None
+    try:
+        gi.require_version("AyatanaAppIndicator3", "0.1")
+        from gi.repository import AyatanaAppIndicator3 as AppIndicator3  # type: ignore
+
+        APP_INDICATOR_AVAILABLE = True
+    except Exception:
+        try:
+            gi.require_version("AppIndicator3", "0.1")
+            from gi.repository import AppIndicator3  # type: ignore
+
+            APP_INDICATOR_AVAILABLE = True
+        except Exception:
+            AppIndicator3 = None
 except Exception:
     GLib = None
     GdkPixbuf = None
     Gtk = None
+    AppIndicator3 = None
     GTK_TRAY_AVAILABLE = False
+    APP_INDICATOR_AVAILABLE = False
 
 
 FALLBACK_VERSION_URL = (
@@ -74,9 +106,9 @@ LEGACY_STRATEGY_PATTERNS = ("general*.bat", "general*.sh")
 AUTOSTART_SERVICE_NAME = "zapret-discord-autostart.service"
 DESKTOP_ENTRY_FILENAME = "zapret-gui.desktop"
 DESKTOP_ICON_BASENAME = "zapret-gui"
-APP_WM_CLASS = "ZapretGui"
+APP_WM_CLASS = "zapret-for-ubuntu"
 APP_ICONS_DIRNAME = "icons"
-APP_ICON_FILENAME = "zapret.ico"
+APP_ICON_FILENAMES = ("zapret.png", "zapret.ico")
 APP_PACKAGE_NAME = "zapret-for-ubuntu"
 
 
@@ -141,6 +173,7 @@ class ZapretGuiApp:
         self.autostart_strategy_file = self.linux_state_dir / "autostart_strategy.txt"
         self.autostart_local_unit = self.linux_state_dir / AUTOSTART_SERVICE_NAME
         self.autostart_system_unit = Path("/etc/systemd/system") / AUTOSTART_SERVICE_NAME
+        self.instance_lock_path = self.linux_state_dir / "gui.lock"
         self.logs_dir = self.linux_root / "logs"
         self.log_file = self.logs_dir / "launcher.log"
 
@@ -159,9 +192,10 @@ class ZapretGuiApp:
         self.settings_button: ttk.Button | None = None
         self.update_button: ttk.Button | None = None
         self.uninstall_button: ttk.Button | None = None
-        self.settings_backdrop: Toplevel | None = None
         self.settings_window: Toplevel | None = None
         self.uninstall_action_enabled = True
+        self.instance_lock_handle = None
+        self.startup_blocked = False
         self.autostart_busy = False
         self.autostart_update_in_progress = False
         self.autostart_enabled_cached = False
@@ -189,6 +223,11 @@ class ZapretGuiApp:
         self.logs_dir.mkdir(parents=True, exist_ok=True)
         self.prepare_icon_assets()
         self._setup_window_class()
+        if not self.acquire_single_instance_lock():
+            self.startup_blocked = True
+            messagebox.showinfo("Zapret", "Приложение уже запущено.")
+            self.root.destroy()
+            return
 
         self._setup_style()
         self._build_ui()
@@ -199,7 +238,6 @@ class ZapretGuiApp:
         self.ensure_desktop_entry()
 
         self.root.protocol("WM_DELETE_WINDOW", self.on_close)
-        self.setup_tray_icon()
 
     def _is_dir_writable(self, path: Path) -> bool:
         try:
@@ -207,6 +245,44 @@ class ZapretGuiApp:
         except OSError:
             return False
         return os.access(path, os.W_OK | os.X_OK)
+
+    def acquire_single_instance_lock(self) -> bool:
+        if not POSIX_FLOCK_AVAILABLE or fcntl is None:
+            return True
+        handle = None
+        try:
+            self.linux_state_dir.mkdir(parents=True, exist_ok=True)
+            handle = self.instance_lock_path.open("w", encoding="utf-8")
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            handle.seek(0)
+            handle.truncate(0)
+            handle.write(f"{os.getpid()}\n")
+            handle.flush()
+            self.instance_lock_handle = handle
+            return True
+        except OSError:
+            try:
+                if handle is not None:
+                    handle.close()
+            except Exception:
+                pass
+            return False
+
+    def release_single_instance_lock(self) -> None:
+        if not POSIX_FLOCK_AVAILABLE or fcntl is None:
+            return
+        handle = self.instance_lock_handle
+        self.instance_lock_handle = None
+        if handle is None:
+            return
+        try:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        except Exception:
+            pass
+        try:
+            handle.close()
+        except Exception:
+            pass
 
     def _detect_portable_layout(self) -> bool:
         installed_root = (Path("/opt") / APP_PACKAGE_NAME).resolve()
@@ -477,18 +553,18 @@ class ZapretGuiApp:
         )
         style.configure(
             "TopIcon.TButton",
-            font=("Ubuntu", 18),
-            foreground=self.palette["muted"],
-            background=self.palette["bg"],
-            borderwidth=0,
+            font=("Ubuntu", 12, "bold"),
+            foreground=self.palette["accent_hover"],
+            background=self.palette["card_alt"],
+            borderwidth=1,
             focusthickness=0,
             relief="flat",
-            padding=(10, 5),
+            padding=(10, 6),
         )
         style.map(
             "TopIcon.TButton",
-            foreground=[("active", self.palette["accent_hover"])],
-            background=[("active", self.palette["bg"])],
+            foreground=[("active", "#fff2e4")],
+            background=[("active", "#1a2233")],
         )
         style.configure(
             "DialogTitle.TLabel",
@@ -555,34 +631,51 @@ class ZapretGuiApp:
             pass
 
     def resolve_icon_source_path(self) -> Path:
-        preferred = self.icons_dir / APP_ICON_FILENAME
-        legacy = self.app_dir / APP_ICON_FILENAME
         try:
             self.icons_dir.mkdir(parents=True, exist_ok=True)
         except OSError:
-            return preferred if preferred.exists() else legacy
+            pass
 
-        if preferred.exists():
-            return preferred
+        for filename in APP_ICON_FILENAMES:
+            candidate = self.icons_dir / filename
+            if candidate.exists():
+                return candidate
 
-        if legacy.exists():
+        for filename in APP_ICON_FILENAMES:
+            legacy = self.app_dir / filename
+            target = self.icons_dir / filename
+            if not legacy.exists():
+                continue
             try:
-                shutil.move(str(legacy), str(preferred))
-                return preferred
+                shutil.move(str(legacy), str(target))
+                return target
             except OSError:
                 try:
-                    shutil.copy2(legacy, preferred)
-                    return preferred
+                    shutil.copy2(legacy, target)
+                    return target
                 except OSError:
                     return legacy
 
-        return preferred
+        return self.icons_dir / APP_ICON_FILENAMES[0]
 
     def _setup_window_icon(self) -> None:
-        if PIL_AVAILABLE and Image is not None and ImageTk is not None and self.icon_source_path.exists():
+        if self.icon_source_path.exists():
+            if PIL_IMAGE_AVAILABLE and Image is not None:
+                try:
+                    image = Image.open(self.icon_source_path).convert("RGBA")
+                    if PIL_IMAGETK_AVAILABLE and ImageTk is not None:
+                        self.tk_icon_photo = ImageTk.PhotoImage(image)
+                        self.root.iconphoto(True, self.tk_icon_photo)
+                        return
+                    self.linux_state_dir.mkdir(parents=True, exist_ok=True)
+                    image.save(self.icon_png_path, format="PNG")
+                    self.tk_icon_photo = PhotoImage(file=str(self.icon_png_path))
+                    self.root.iconphoto(True, self.tk_icon_photo)
+                    return
+                except Exception:
+                    pass
             try:
-                image = Image.open(self.icon_source_path).convert("RGBA")
-                self.tk_icon_photo = ImageTk.PhotoImage(image)
+                self.tk_icon_photo = PhotoImage(file=str(self.icon_source_path))
                 self.root.iconphoto(True, self.tk_icon_photo)
                 return
             except Exception:
@@ -604,10 +697,10 @@ class ZapretGuiApp:
         top_bar.pack(fill="x", pady=(8, 8))
         self.settings_button = ttk.Button(
             top_bar,
-            text="⚙",
+            text="⚙ Настройки",
             style="TopIcon.TButton",
             command=self.open_settings_modal,
-            width=4,
+            width=12,
         )
         self.settings_button.pack(side="right")
 
@@ -862,12 +955,53 @@ class ZapretGuiApp:
         self.tray_thread = threading.Thread(target=self._tray_main, daemon=True)
         self.tray_thread.start()
 
+    def _build_tray_menu(self) -> tuple[object, object]:
+        if Gtk is None:
+            raise RuntimeError("Gtk is unavailable.")
+        menu = Gtk.Menu()
+        item_show = Gtk.MenuItem(label="Show Zapret")
+        item_show.connect("activate", self._tray_on_show)
+        menu.append(item_show)
+
+        item_toggle = Gtk.MenuItem(label="Connect")
+        item_toggle.connect("activate", self._tray_on_toggle)
+        menu.append(item_toggle)
+
+        item_exit = Gtk.MenuItem(label="Exit")
+        item_exit.connect("activate", self._tray_on_exit)
+        menu.append(item_exit)
+        menu.show_all()
+        return menu, item_toggle
+
     def _tray_main(self) -> None:
         if Gtk is None:
             return
         try:
-            icon = Gtk.StatusIcon()
+            menu, item_toggle = self._build_tray_menu()
             icon_path = self.icon_png_path if self.icon_png_path.exists() else self.icon_source_path
+
+            if APP_INDICATOR_AVAILABLE and AppIndicator3 is not None:
+                try:
+                    indicator = AppIndicator3.Indicator.new(
+                        APP_PACKAGE_NAME,
+                        APP_PACKAGE_NAME,
+                        AppIndicator3.IndicatorCategory.APPLICATION_STATUS,
+                    )
+                    indicator.set_icon(APP_PACKAGE_NAME)
+
+                    indicator.set_menu(menu)
+                    indicator.set_status(AppIndicator3.IndicatorStatus.ACTIVE)
+                    self.tray_icon = indicator
+                    self.tray_menu = menu
+                    self.tray_toggle_item = item_toggle
+                    self.tray_available = True
+                    self.refresh_tray_menu_state()
+                    Gtk.main()
+                    return
+                except Exception:
+                    self.log("AppIndicator is unavailable, falling back to Gtk.StatusIcon.")
+
+            icon = Gtk.StatusIcon()
             if icon_path.exists():
                 try:
                     if GdkPixbuf is not None:
@@ -882,20 +1016,6 @@ class ZapretGuiApp:
             icon.set_title("Zapret")
             icon.set_tooltip_text("Zapret")
             icon.set_visible(True)
-
-            menu = Gtk.Menu()
-            item_show = Gtk.MenuItem(label="Show Zapret")
-            item_show.connect("activate", self._tray_on_show)
-            menu.append(item_show)
-
-            item_toggle = Gtk.MenuItem(label="Connect")
-            item_toggle.connect("activate", self._tray_on_toggle)
-            menu.append(item_toggle)
-
-            item_exit = Gtk.MenuItem(label="Exit")
-            item_exit.connect("activate", self._tray_on_exit)
-            menu.append(item_exit)
-            menu.show_all()
 
             icon.connect("activate", self._tray_on_show)
             icon.connect("popup-menu", self._tray_on_popup)
@@ -960,7 +1080,15 @@ class ZapretGuiApp:
         def _quit() -> bool:
             try:
                 if self.tray_icon is not None:
-                    self.tray_icon.set_visible(False)
+                    if APP_INDICATOR_AVAILABLE and AppIndicator3 is not None:
+                        try:
+                            self.tray_icon.set_status(AppIndicator3.IndicatorStatus.PASSIVE)
+                        except Exception:
+                            pass
+                    try:
+                        self.tray_icon.set_visible(False)
+                    except Exception:
+                        pass
             except Exception:
                 pass
             try:
@@ -975,23 +1103,16 @@ class ZapretGuiApp:
     def exit_application(self) -> None:
         if self.is_exiting:
             return
-        if self.update_in_progress:
-            self.log("Update is in progress. Exit is blocked until update finishes.")
-            return
-        if self.is_busy and self.busy_operation == "uninstall":
-            self.log("Uninstall is in progress. Exit is blocked until it finishes.")
-            return
         self.is_exiting = True
         self._close_settings_modal()
-        if not sys.platform.startswith("linux"):
-            self.disconnect()
-        elif self.is_busy:
+        if self.is_busy:
             self._request_cancel()
         self.stop_tray_icon()
+        self.release_single_instance_lock()
         self.root.destroy()
 
     def prepare_icon_assets(self) -> None:
-        if not self.icon_source_path.exists() or not PIL_AVAILABLE or Image is None:
+        if not self.icon_source_path.exists() or not PIL_IMAGE_AVAILABLE or Image is None:
             return
         try:
             self.linux_state_dir.mkdir(parents=True, exist_ok=True)
@@ -1039,7 +1160,7 @@ class ZapretGuiApp:
             self.log(f"Failed to prepare desktop entry directories: {exc}")
             return
 
-        if PIL_AVAILABLE and Image is not None and self.icon_source_path.exists():
+        if PIL_IMAGE_AVAILABLE and Image is not None and self.icon_source_path.exists():
             try:
                 image = Image.open(self.icon_source_path).convert("RGBA")
                 image = image.resize((256, 256), RESAMPLE_LANCZOS)
@@ -1105,35 +1226,28 @@ class ZapretGuiApp:
         root_w = max(320, self.root.winfo_width())
         root_h = max(280, self.root.winfo_height())
 
-        backdrop = Toplevel(self.root)
-        backdrop.overrideredirect(True)
-        backdrop.transient(self.root)
-        backdrop.configure(bg="#05070e")
-        backdrop.geometry(f"{root_w}x{root_h}+{root_x}+{root_y}")
-        try:
-            backdrop.attributes("-alpha", 0.64)
-        except Exception:
-            pass
-        backdrop.lift()
-        backdrop.bind("<Button-1>", lambda _event: self._close_settings_modal())
-
         dialog = Toplevel(self.root)
         dialog.overrideredirect(True)
         dialog.transient(self.root)
-        dialog.configure(bg=self.palette["bg"])
-        dialog_w = 336
-        dialog_h = 210
-        dialog_x = root_x + (root_w - dialog_w) // 2
-        dialog_y = root_y + (root_h - dialog_h) // 2
-        dialog.geometry(f"{dialog_w}x{dialog_h}+{dialog_x}+{dialog_y}")
+        dialog.configure(bg="#05070e")
+        dialog.geometry(f"{root_w}x{root_h}+{root_x}+{root_y}")
+        try:
+            dialog.attributes("-alpha", 0.74)
+        except Exception:
+            pass
         dialog.lift()
+        dialog.focus_set()
+        dialog.bind(
+            "<Button-1>",
+            lambda event: self._close_settings_modal() if event.widget is dialog else None,
+        )
         dialog.bind("<Escape>", lambda _event: self._close_settings_modal())
         dialog.protocol("WM_DELETE_WINDOW", self._close_settings_modal)
         dialog.focus_force()
         dialog.grab_set()
 
         card = ttk.Frame(dialog, style="Card.TFrame", padding=(16, 14))
-        card.pack(fill="both", expand=True)
+        card.place(relx=0.5, rely=0.5, anchor="center", width=336, height=216)
 
         ttk.Label(card, text="Настройки", style="DialogTitle.TLabel").pack(anchor="center")
         ttk.Label(
@@ -1163,7 +1277,6 @@ class ZapretGuiApp:
             command=self._close_settings_modal,
         ).pack(anchor="center", pady=(12, 0))
 
-        self.settings_backdrop = backdrop
         self.settings_window = dialog
         self.set_uninstall_button_enabled(self.uninstall_action_enabled)
 
@@ -1177,11 +1290,6 @@ class ZapretGuiApp:
             except Exception:
                 pass
             dialog.destroy()
-
-        backdrop = self.settings_backdrop
-        self.settings_backdrop = None
-        if backdrop is not None and backdrop.winfo_exists():
-            backdrop.destroy()
 
     def _settings_open_logs(self) -> None:
         self._close_settings_modal()
@@ -3031,15 +3139,14 @@ class ZapretGuiApp:
     def on_close(self) -> None:
         if self.settings_window is not None and self.settings_window.winfo_exists():
             self._close_settings_modal()
-        if self.tray_available and not self.is_exiting:
-            self.hide_window_to_tray()
-            return
         self.exit_application()
 
 
 def main() -> None:
     root = Tk(className=APP_WM_CLASS)
     app = ZapretGuiApp(root=root, app_dir=Path(__file__).resolve().parent)
+    if app.startup_blocked:
+        return
     app.log(f"Source directory: {app.source_dir}")
     app.log(f"Launcher started. Log file: {app.log_file}")
     root.mainloop()

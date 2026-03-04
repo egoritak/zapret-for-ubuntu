@@ -17,6 +17,7 @@ mkdir -p "${PKG_ROOT}/opt/${APP_NAME}/icons"
 mkdir -p "${PKG_ROOT}/opt/${APP_NAME}/zapret-discord"
 mkdir -p "${PKG_ROOT}/usr/bin"
 mkdir -p "${PKG_ROOT}/usr/share/applications"
+mkdir -p "${PKG_ROOT}/usr/share/icons/hicolor/256x256/apps"
 mkdir -p "${PKG_ROOT}/usr/share/doc/${APP_NAME}"
 
 install -m 0755 "${ROOT_DIR}/run-ubuntu-gui.sh" "${PKG_ROOT}/opt/${APP_NAME}/run-ubuntu-gui.sh"
@@ -27,6 +28,10 @@ install -m 0644 "${ROOT_DIR}/README.md" "${PKG_ROOT}/usr/share/doc/${APP_NAME}/R
 
 if [ -f "${ROOT_DIR}/icons/zapret.ico" ]; then
   install -m 0644 "${ROOT_DIR}/icons/zapret.ico" "${PKG_ROOT}/opt/${APP_NAME}/icons/zapret.ico"
+fi
+if [ -f "${ROOT_DIR}/icons/zapret.png" ]; then
+  install -m 0644 "${ROOT_DIR}/icons/zapret.png" "${PKG_ROOT}/opt/${APP_NAME}/icons/zapret.png"
+  install -m 0644 "${ROOT_DIR}/icons/zapret.png" "${PKG_ROOT}/usr/share/icons/hicolor/256x256/apps/${APP_NAME}.png"
 fi
 
 touch "${PKG_ROOT}/opt/${APP_NAME}/zapret-discord/.gitkeep"
@@ -45,11 +50,11 @@ Type=Application
 Name=Zapret for Ubuntu
 Comment=GUI launcher for zapret on Ubuntu
 Exec=/usr/bin/${APP_NAME}
-Icon=/opt/${APP_NAME}/icons/zapret.ico
+Icon=${APP_NAME}
 Terminal=false
 Categories=Network;Utility;
 StartupNotify=true
-StartupWMClass=ZapretGui
+StartupWMClass=zapret-for-ubuntu
 EOF
 
 cat > "${PKG_ROOT}/DEBIAN/control" <<EOF
@@ -59,7 +64,8 @@ Section: net
 Priority: optional
 Architecture: ${ARCH}
 Maintainer: ${MAINTAINER}
-Depends: python3, python3-tk, python3-pil, python3-gi, gir1.2-gtk-3.0, policykit-1 | sudo, git, make, gcc
+Depends: python3, python3-tk, python3-pil, python3-pil.imagetk, python3-gi, gir1.2-gtk-3.0, policykit-1 | sudo, git, make, gcc
+Recommends: gir1.2-ayatanaappindicator3-0.1 | gir1.2-appindicator3-0.1, gnome-shell-extension-appindicator
 Description: Ubuntu GUI launcher for zapret-discord-youtube
  Linux desktop application to manage zapret strategies through a modern GUI.
  Includes systemd-based connect/disconnect control and built-in update flow.
@@ -71,6 +77,9 @@ set -euo pipefail
 
 if command -v update-desktop-database >/dev/null 2>&1; then
   update-desktop-database /usr/share/applications || true
+fi
+if command -v gtk-update-icon-cache >/dev/null 2>&1; then
+  gtk-update-icon-cache -f /usr/share/icons/hicolor >/dev/null 2>&1 || true
 fi
 EOF
 chmod 0755 "${PKG_ROOT}/DEBIAN/postinst"
