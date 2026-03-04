@@ -17,6 +17,30 @@ log() {
   printf '[UNINSTALL] %s\n' "$*"
 }
 
+resolve_ws_user() {
+  if [ -n "${SUDO_USER:-}" ] && [ "${SUDO_USER}" != "root" ]; then
+    printf '%s' "${SUDO_USER}"
+    return
+  fi
+
+  if [ -n "${PKEXEC_UID:-}" ] && [ "${PKEXEC_UID}" != "0" ]; then
+    getent passwd "${PKEXEC_UID}" | cut -d: -f1 || true
+    return
+  fi
+
+  printf ''
+}
+
+resolve_ws_home() {
+  local ws_user
+  ws_user="$(resolve_ws_user)"
+  if [ -z "$ws_user" ]; then
+    printf ''
+    return
+  fi
+  getent passwd "$ws_user" | cut -d: -f6 || true
+}
+
 ensure_root() {
   if [ "$(id -u)" -eq 0 ]; then
     return
@@ -34,10 +58,17 @@ ensure_root() {
 }
 
 confirm_if_needed() {
+  local ws_home
+  ws_home="$(resolve_ws_home)"
+  local sources_hint="${APP_DIR}/zapret-discord"
+  if [ -n "$ws_home" ]; then
+    sources_hint="${ws_home}/.local/share/${APP_NAME}/zapret-discord"
+  fi
+
   if [ "$ASSUME_YES" -eq 1 ]; then
     return
   fi
-  printf "This will remove systemd service, '%s/zapret-discord' and package '%s'. Continue? [y/N]: " "$APP_DIR" "$APP_NAME"
+  printf "This will remove systemd service, '%s' and package '%s'. Continue? [y/N]: " "$sources_hint" "$APP_NAME"
   read -r answer
   case "$answer" in
     y|Y|yes|YES) ;;
@@ -60,12 +91,7 @@ cleanup_systemd_service() {
 
 cleanup_user_desktop_entries() {
   local ws_user=""
-
-  if [ -n "${SUDO_USER:-}" ] && [ "${SUDO_USER}" != "root" ]; then
-    ws_user="${SUDO_USER}"
-  elif [ -n "${PKEXEC_UID:-}" ] && [ "${PKEXEC_UID}" != "0" ]; then
-    ws_user="$(getent passwd "${PKEXEC_UID}" | cut -d: -f1 || true)"
-  fi
+  ws_user="$(resolve_ws_user)"
 
   if [ -z "$ws_user" ]; then
     return
@@ -82,6 +108,20 @@ cleanup_user_desktop_entries() {
 }
 
 cleanup_local_dirs() {
+  local ws_home=""
+  ws_home="$(resolve_ws_home)"
+
+  if [ -n "$ws_home" ]; then
+    if [ -d "${ws_home}/.local/share/${APP_NAME}/zapret-discord" ]; then
+      log "Removing ${ws_home}/.local/share/${APP_NAME}/zapret-discord ..."
+      rm -rf "${ws_home}/.local/share/${APP_NAME}/zapret-discord"
+    fi
+    if [ -d "${ws_home}/.local/state/${APP_NAME}" ]; then
+      log "Removing ${ws_home}/.local/state/${APP_NAME} ..."
+      rm -rf "${ws_home}/.local/state/${APP_NAME}"
+    fi
+  fi
+
   if [ -d "${APP_DIR}/zapret-discord" ]; then
     log "Removing ${APP_DIR}/zapret-discord ..."
     rm -rf "${APP_DIR}/zapret-discord"

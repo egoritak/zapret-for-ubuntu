@@ -77,6 +77,7 @@ DESKTOP_ICON_BASENAME = "zapret-gui"
 APP_WM_CLASS = "ZapretGui"
 APP_ICONS_DIRNAME = "icons"
 APP_ICON_FILENAME = "zapret.ico"
+APP_PACKAGE_NAME = "zapret-for-ubuntu"
 
 
 def natural_sort_key(value: str) -> list[object]:
@@ -104,6 +105,11 @@ class ZapretGuiApp:
     def __init__(self, root: Tk, app_dir: Path) -> None:
         self.root = root
         self.app_dir = app_dir
+        self.portable_layout = self._is_dir_writable(self.app_dir)
+        self.runtime_user = self._detect_runtime_user()
+        self.runtime_home = self._resolve_runtime_home()
+        self.data_root = self._resolve_data_root()
+        self.linux_root = self._resolve_linux_root()
         self.sources_root = self._prepare_sources_root()
         self.source_dir = self._prepare_source_dir()
         self.process: subprocess.Popen[str] | None = None
@@ -125,7 +131,6 @@ class ZapretGuiApp:
         self.admin_auth_requested = False
         self.last_selected_strategy: Strategy | None = None
 
-        self.linux_root = self.app_dir / ".linux-backend"
         self.linux_repo_dir = self.linux_root / "zapret"
         self.linux_state_dir = self.linux_root / "state"
         self.linux_sync_stamp = self.linux_root / ".last_sync"
@@ -193,19 +198,81 @@ class ZapretGuiApp:
         self.root.protocol("WM_DELETE_WINDOW", self.on_close)
         self.setup_tray_icon()
 
+    def _is_dir_writable(self, path: Path) -> bool:
+        try:
+            path.mkdir(parents=True, exist_ok=True)
+        except OSError:
+            return False
+        return os.access(path, os.W_OK | os.X_OK)
+
+    def _detect_runtime_user(self) -> str:
+        for env_name in ("SUDO_USER", "PKEXEC_UID", "USER", "LOGNAME"):
+            raw = os.environ.get(env_name, "").strip()
+            if not raw:
+                continue
+            if env_name == "PKEXEC_UID":
+                try:
+                    uid = int(raw)
+                except ValueError:
+                    continue
+                if uid != 0:
+                    try:
+                        return pwd.getpwuid(uid).pw_name
+                    except KeyError:
+                        continue
+                continue
+            if raw != "root":
+                return raw
+        current = (getpass.getuser() or "root").strip()
+        return current or "root"
+
+    def _resolve_runtime_home(self) -> Path:
+        try:
+            return Path(pwd.getpwnam(self.runtime_user).pw_dir).resolve()
+        except Exception:
+            return Path.home().resolve()
+
+    def _resolve_data_root(self) -> Path:
+        if self.portable_layout:
+            return self.app_dir
+        return self.runtime_home / ".local" / "share" / APP_PACKAGE_NAME
+
+    def _resolve_linux_root(self) -> Path:
+        if self.portable_layout:
+            return self.app_dir / ".linux-backend"
+        return self.runtime_home / ".local" / "state" / APP_PACKAGE_NAME
+
+    def _move_or_copy_path(self, src: Path, dst: Path) -> bool:
+        try:
+            if self.portable_layout:
+                shutil.move(str(src), str(dst))
+                return True
+
+            if src.is_dir():
+                if dst.exists():
+                    return False
+                shutil.copytree(src, dst)
+                return True
+
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(src, dst)
+            return True
+        except Exception:
+            return False
+
     def _prepare_sources_root(self) -> Path:
-        primary = self.app_dir / SOURCES_DIRNAME
+        primary = self.data_root / SOURCES_DIRNAME
         if not primary.exists():
             for legacy_name in LEGACY_SOURCES_DIRNAMES:
-                legacy = self.app_dir / legacy_name
+                legacy = self.data_root / legacy_name
                 if not legacy.exists():
                     continue
-                try:
-                    shutil.move(str(legacy), str(primary))
+                if self._move_or_copy_path(legacy, primary):
                     break
-                except Exception:
-                    # If move failed, keep fallback logic in _prepare_source_dir.
-                    break
+        if not primary.exists() and not self.portable_layout:
+            bundled_root = self.app_dir / SOURCES_DIRNAME
+            if bundled_root.exists() and self._path_has_source_markers(bundled_root):
+                self._move_or_copy_path(bundled_root, primary)
         primary.mkdir(parents=True, exist_ok=True)
         return primary
 
@@ -246,16 +313,16 @@ class ZapretGuiApp:
             dst = self.sources_root / name
             if not src.exists() or dst.exists():
                 continue
-            shutil.move(str(src), str(dst))
-            moved_any = True
+            if self._move_or_copy_path(src, dst):
+                moved_any = True
 
         for name in LEGACY_SOURCE_FILES:
             src = self.app_dir / name
             dst = self.sources_root / name
             if not src.exists() or dst.exists():
                 continue
-            shutil.move(str(src), str(dst))
-            moved_any = True
+            if self._move_or_copy_path(src, dst):
+                moved_any = True
 
         for pattern in LEGACY_STRATEGY_PATTERNS:
             for src in self.app_dir.glob(pattern):
@@ -264,8 +331,8 @@ class ZapretGuiApp:
                 dst = self.sources_root / src.name
                 if dst.exists():
                     continue
-                shutil.move(str(src), str(dst))
-                moved_any = True
+                if self._move_or_copy_path(src, dst):
+                    moved_any = True
 
         return moved_any
 
