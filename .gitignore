@@ -5,7 +5,6 @@ __pycache__/
 
 # Runtime/update-managed source payload
 /zapret-discord/*
-!/zapret-discord/.gitkeep
 
 # Legacy flat-layout mutable files
 /utils/test results

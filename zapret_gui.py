@@ -122,6 +122,7 @@ class ZapretGuiApp:
         self.update_spinner_index = 0
         self.update_animation_job: str | None = None
         self.no_strategy_update_attempted = False
+        self.admin_auth_requested = False
         self.last_selected_strategy: Strategy | None = None
 
         self.linux_root = self.app_dir / ".linux-backend"
@@ -187,6 +188,7 @@ class ZapretGuiApp:
         self.ensure_managed_service_async()
         self.refresh_autostart_state_async()
         self.ensure_desktop_entry()
+        self.request_admin_auth_async()
 
         self.root.protocol("WM_DELETE_WINDOW", self.on_close)
         self.setup_tray_icon()
@@ -1231,6 +1233,32 @@ class ZapretGuiApp:
         if shutil.which("sudo") is not None:
             return ["sudo", *command]
         raise RuntimeError("Neither pkexec nor sudo is available for privileged Linux operations.")
+
+    def request_admin_auth_async(self) -> None:
+        if not sys.platform.startswith("linux"):
+            return
+        if os.geteuid() == 0:
+            return
+        if self.admin_auth_requested:
+            return
+        self.admin_auth_requested = True
+        threading.Thread(target=self.request_admin_auth, daemon=True).start()
+
+    def request_admin_auth(self) -> None:
+        self.log("Requesting administrator authentication...")
+        try:
+            command = self.elevate_command(["/usr/bin/true"])
+            rc, output = self.run_command_capture(command, cwd=self.app_dir)
+            if output:
+                for line in output.splitlines():
+                    if line.strip():
+                        self.log(line.strip())
+            if rc == 0:
+                self.log("Administrator authentication granted.")
+            else:
+                self.log("Administrator authentication was not granted. It may be requested again later.")
+        except Exception as exc:  # pylint: disable=broad-except
+            self.log(f"[ERROR] Failed to request administrator authentication: {exc}")
 
     def refresh_strategies(self, quiet: bool = False) -> None:
         found: list[Strategy] = []
