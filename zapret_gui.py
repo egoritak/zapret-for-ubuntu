@@ -105,7 +105,7 @@ class ZapretGuiApp:
     def __init__(self, root: Tk, app_dir: Path) -> None:
         self.root = root
         self.app_dir = app_dir
-        self.portable_layout = self._is_dir_writable(self.app_dir)
+        self.portable_layout = self._detect_portable_layout()
         self.runtime_user = self._detect_runtime_user()
         self.runtime_home = self._resolve_runtime_home()
         self.data_root = self._resolve_data_root()
@@ -128,6 +128,7 @@ class ZapretGuiApp:
         self.update_spinner_index = 0
         self.update_animation_job: str | None = None
         self.no_strategy_update_attempted = False
+        self.connect_after_update_requested = False
         self.admin_auth_requested = False
         self.last_selected_strategy: Strategy | None = None
 
@@ -204,6 +205,13 @@ class ZapretGuiApp:
         except OSError:
             return False
         return os.access(path, os.W_OK | os.X_OK)
+
+    def _detect_portable_layout(self) -> bool:
+        installed_root = (Path("/opt") / APP_PACKAGE_NAME).resolve()
+        app_root = self.app_dir.resolve()
+        if app_root == installed_root or installed_root in app_root.parents:
+            return False
+        return self._is_dir_writable(self.app_dir)
 
     def _detect_runtime_user(self) -> str:
         for env_name in ("SUDO_USER", "PKEXEC_UID", "USER", "LOGNAME"):
@@ -977,6 +985,9 @@ class ZapretGuiApp:
     def ensure_desktop_entry(self) -> None:
         if not sys.platform.startswith("linux"):
             return
+        if not self.portable_layout:
+            self._cleanup_user_desktop_entry()
+            return
 
         user = self.determine_ws_user()
         try:
@@ -1040,10 +1051,25 @@ class ZapretGuiApp:
         except OSError as exc:
             self.log(f"Failed to write desktop entry: {exc}")
 
+    def _cleanup_user_desktop_entry(self) -> None:
+        apps_dir = self.runtime_home / ".local" / "share" / "applications"
+        icons_dir = self.runtime_home / ".local" / "share" / "icons" / "hicolor" / "256x256" / "apps"
+        desktop_file = apps_dir / DESKTOP_ENTRY_FILENAME
+        icon_file = icons_dir / f"{DESKTOP_ICON_BASENAME}.png"
+
+        try:
+            desktop_file.unlink(missing_ok=True)
+        except OSError:
+            pass
+        try:
+            icon_file.unlink(missing_ok=True)
+        except OSError:
+            pass
+
     def toggle_connection(self) -> None:
         if not self.strategies_map:
             self.log("No strategy available. Trying to recover from latest release...")
-            self.start_update_for_no_strategy(automatic=False)
+            self.start_update_for_no_strategy(automatic=False, connect_after_update=True)
             return
         if self.update_in_progress:
             self.log("Update is in progress. Wait until it finishes.")
@@ -2399,7 +2425,7 @@ class ZapretGuiApp:
             daemon=True,
         ).start()
 
-    def start_update_for_no_strategy(self, *, automatic: bool) -> None:
+    def start_update_for_no_strategy(self, *, automatic: bool, connect_after_update: bool = False) -> None:
         if self.strategies_map:
             return
         if self.update_in_progress:
@@ -2412,6 +2438,8 @@ class ZapretGuiApp:
             return
         if automatic:
             self.no_strategy_update_attempted = True
+        if connect_after_update:
+            self.connect_after_update_requested = True
 
         def _worker() -> None:
             try:
@@ -2613,6 +2641,11 @@ class ZapretGuiApp:
                 self.refresh_autostart_state_async()
                 self.check_updates_async()
                 self.refresh_action_button()
+                connect_after = self.connect_after_update_requested
+                self.connect_after_update_requested = False
+                if connect_after and self.strategies_map:
+                    self.log("Strategies installed. Continuing connection...")
+                    self.connect()
 
             self.root.after(0, _finish)
 
