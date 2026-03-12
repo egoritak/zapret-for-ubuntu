@@ -64,7 +64,7 @@ Section: net
 Priority: optional
 Architecture: ${ARCH}
 Maintainer: ${MAINTAINER}
-Depends: python3, python3-tk, python3-pil, python3-pil.imagetk, python3-gi, gir1.2-gtk-3.0, policykit-1 | sudo, git, make, gcc
+Depends: python3, python3-tk, python3-pil, python3-pil.imagetk, python3-gi, gir1.2-gtk-3.0, policykit-1 | sudo, git, build-essential, zlib1g-dev, libcap-dev, libmnl-dev, libnetfilter-queue-dev, libnfnetlink-dev
 Recommends: gir1.2-ayatanaappindicator3-0.1 | gir1.2-appindicator3-0.1, gnome-shell-extension-appindicator
 Description: Ubuntu GUI launcher for zapret-discord-youtube
  Linux desktop application to manage zapret strategies through a modern GUI.

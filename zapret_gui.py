@@ -110,6 +110,14 @@ APP_WM_CLASS = "zapret-for-ubuntu"
 APP_ICONS_DIRNAME = "icons"
 APP_ICON_FILENAMES = ("zapret.png", "zapret.ico")
 APP_PACKAGE_NAME = "zapret-for-ubuntu"
+LINUX_BUILD_DEPENDENCIES = (
+    "build-essential",
+    "zlib1g-dev",
+    "libcap-dev",
+    "libmnl-dev",
+    "libnetfilter-queue-dev",
+    "libnfnetlink-dev",
+)
 
 
 def natural_sort_key(value: str) -> list[object]:
@@ -2118,6 +2126,39 @@ class ZapretGuiApp:
         self.linux_root.mkdir(parents=True, exist_ok=True)
         self.linux_sync_stamp.write_text(str(time.time()), encoding="utf-8")
 
+    def get_missing_linux_build_dependencies(self) -> list[str]:
+        if not sys.platform.startswith("linux"):
+            return []
+        if shutil.which("dpkg-query") is None:
+            return list(LINUX_BUILD_DEPENDENCIES)
+
+        missing: list[str] = []
+        for package in LINUX_BUILD_DEPENDENCIES:
+            rc, _output = self.run_command_capture(
+                ["dpkg-query", "-W", "-f=${Status}", package],
+                cwd=self.app_dir,
+            )
+            if rc != 0:
+                missing.append(package)
+        return missing
+
+    def ensure_linux_build_dependencies(self) -> None:
+        missing = self.get_missing_linux_build_dependencies()
+        if not missing:
+            return
+        if shutil.which("apt-get") is None:
+            missing_text = ", ".join(missing)
+            raise RuntimeError(
+                "Missing Linux build dependencies and apt-get is unavailable. "
+                f"Install these packages manually: {missing_text}"
+            )
+
+        self.log(f"Installing Linux build dependencies: {', '.join(missing)}")
+        self.run_elevated_commands_batch(
+            [["apt-get", "install", "-y", "--no-install-recommends", *missing]],
+            cwd=self.app_dir,
+        )
+
     def ensure_linux_backend(self) -> None:
         self.linux_root.mkdir(parents=True, exist_ok=True)
         nfqws_bin = self.linux_repo_dir / "nfq" / "nfqws"
@@ -2145,6 +2186,7 @@ class ZapretGuiApp:
             need_build = True
 
         if need_build:
+            self.ensure_linux_build_dependencies()
             jobs = max(1, min(os.cpu_count() or 1, 8))
             self.log("Building Linux binaries (nfqws/tpws/ip2net/mdig)...")
             self.run_logged_command(

@@ -22,6 +22,8 @@ sudo dpkg -i ./zapret-for-ubuntu_*.deb
 sudo apt-get -f install
 ```
 
+Пакет подтянет зависимости для локальной сборки Linux backend (`build-essential`, `zlib1g-dev`, `libcap-dev`, `libmnl-dev`, `libnetfilter-queue-dev`, `libnfnetlink-dev`).
+
 Запуск после установки:
 
 ```bash
@@ -40,6 +42,8 @@ zapret-for-ubuntu
 2. Выбери альтернативу в списке.
 3. Нажми `Connect`.
 4. Подтверди запрос прав администратора.
+
+На первом подключении приложение при необходимости доустановит системные build-зависимости для `zapret` и соберет `nfqws/tpws/ip2net/mdig`.
 
 Если стратегий нет, приложение само предложит обновление и скачает актуальный набор.
 
